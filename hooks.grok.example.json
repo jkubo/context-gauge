@@ -1,0 +1,39 @@
+{
+  "_comment": "Grok Build: copy to ~/.grok/hooks/context-gauge.json (or merge). Reload with /hooks → r. Floor cache: ~/.context-gauge/floors/<session_id>.json",
+
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/context-gauge",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/context-gauge",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.local/bin/context-gauge",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

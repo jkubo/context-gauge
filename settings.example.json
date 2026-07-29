@@ -1,9 +1,9 @@
 {
-  "_comment": "Example ~/.claude/settings.json fragment for claude-context-gauge. Use the statusLine, the UserPromptSubmit hook, or both. Replace $HOME/... with an absolute path if your shell does not expand it. Merge these keys into your existing settings.json rather than replacing the file.",
+  "_comment": "Claude Code: merge into ~/.claude/settings.json. Use statusLine, UserPromptSubmit, or both. Replace $HOME with an absolute path if your shell does not expand it.",
 
   "statusLine": {
     "type": "command",
-    "command": "$HOME/.local/bin/claude-context-gauge",
+    "command": "$HOME/.local/bin/context-gauge",
     "padding": 0
   },
 
@@ -11,7 +11,7 @@
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "$HOME/.local/bin/claude-context-gauge" }
+          { "type": "command", "command": "$HOME/.local/bin/context-gauge" }
         ]
       }
     ]

@@ -1,10 +1,9 @@
-"""Tests for claude-context-gauge — the dual-mode statusLine + UserPromptSubmit gauge.
+"""Tests for context-gauge — multi-harness statusLine + UserPromptSubmit gauge.
 
 Layers:
-  - unit: band_for / compute_fill / scan_usage / reading (import the script as a module)
-  - regression: newest usage line far from EOF is still found (tail-blind-spot)
-  - black-box: run the script binary in BOTH modes; assert FAIL-OPEN (always rc 0,
-    a UserPromptSubmit hook must never block/erase the prompt).
+  - unit: band_for / compute_fill / scan_usage / Claude + Grok readings
+  - regression: aborted-turn stub, tail-blind-spot, Grok floor sticky + compact reseed
+  - black-box: run the script binary; assert FAIL-OPEN (always rc 0)
 
 Run:  python3 -m pytest tests/ -v      (or)      python3 tests/test_gauge.py
 """
@@ -16,14 +15,13 @@ import sys
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(os.path.dirname(HERE), "claude-context-gauge")
+SCRIPT = os.path.join(os.path.dirname(HERE), "context-gauge")
 
-# import the extensionless script as a module (explicit loader — spec_from_file_location
-# can't infer one without a .py suffix). Import-safe: all work is under __main__.
-_loader = SourceFileLoader("ccg", SCRIPT)
-_spec = importlib.util.spec_from_loader("ccg", _loader)
+_loader = SourceFileLoader("cg", SCRIPT)
+_spec = importlib.util.spec_from_loader("cg", _loader)
 gauge = importlib.util.module_from_spec(_spec)
 _loader.exec_module(gauge)
 
@@ -98,15 +96,15 @@ class TestBands(unittest.TestCase):
         self.assertIn("60K floor", line)
 
 
-class TestReading(unittest.TestCase):
+class TestClaudeReading(unittest.TestCase):
     def test_working_set_subtracts_floor(self):
         path = _write_transcript([
-            _assistant_line(60_000),   # floor
+            _assistant_line(60_000),
             _assistant_line(120_000),
-            _assistant_line(163_000),  # current
+            _assistant_line(163_000),
         ])
         try:
-            working, total, floor = gauge.reading(path)
+            working, total, floor, _w, _m = gauge.reading_claude(path)
             self.assertEqual(floor, 60_002)
             self.assertEqual(total, 163_002)
             self.assertEqual(working, 103_000)
@@ -117,7 +115,7 @@ class TestReading(unittest.TestCase):
     def test_born_green_first_turn(self):
         path = _write_transcript([_assistant_line(62_000)])
         try:
-            working, _total, _floor = gauge.reading(path)
+            working, _total, _floor, _w, _m = gauge.reading_claude(path)
             self.assertEqual(working, 0)
             self.assertEqual(gauge.band_for(working)[0], "GREEN")
         finally:
@@ -126,18 +124,22 @@ class TestReading(unittest.TestCase):
     def test_no_usage_returns_none(self):
         path = _write_transcript([_tool_result_line(10)])
         try:
-            self.assertIsNone(gauge.reading(path))
+            self.assertIsNone(gauge.reading_claude(path))
         finally:
             os.unlink(path)
 
+    # back-compat alias used by older mental models
+    def test_reading_alias(self):
+        self.assertTrue(hasattr(gauge, "reading_claude"))
 
-class TestScanUsage(unittest.TestCase):
+
+class TestClaudeScanUsage(unittest.TestCase):
     def test_sidechain_and_meta_ignored(self):
         path = _write_transcript([
-            _assistant_line(60_000),                    # floor (main)
-            _assistant_line(900_000, sidechain=True),   # sub-agent — skip
-            _assistant_line(120_000),                   # main current
-            _assistant_line(800_000, meta=True),        # meta — skip
+            _assistant_line(60_000),
+            _assistant_line(900_000, sidechain=True),
+            _assistant_line(120_000),
+            _assistant_line(800_000, meta=True),
         ])
         try:
             first, last = gauge.scan_usage(path)
@@ -146,29 +148,117 @@ class TestScanUsage(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_last_usage_far_from_eof_still_found(self):
-        # REGRESSION: newest main-assistant line sits far before EOF behind a huge
-        # trailing tool_result. The full-file scan must still find it.
+    def test_aborted_turn_stub_does_not_produce_a_false_green(self):
         path = _write_transcript([
             _assistant_line(60_000),
-            _assistant_line(170_000),          # the reading we must NOT miss
-            _tool_result_line(800_000),        # 800KB trailing blob after it
+            _assistant_line(280_000),
+            _assistant_line(0, input_tokens=0),
+        ])
+        try:
+            first, last = gauge.scan_usage(path)
+            self.assertEqual(gauge.compute_fill(first), 60_002)
+            self.assertEqual(gauge.compute_fill(last), 280_002)
+            working, total, _floor, _w, _m = gauge.reading_claude(path)
+            self.assertEqual(total, 280_002)
+            self.assertEqual(working, 220_000)
+            self.assertNotEqual(gauge.band_for(working)[0], "GREEN")
+        finally:
+            os.unlink(path)
+
+    def test_aborted_turn_stub_is_not_used_as_the_floor(self):
+        path = _write_transcript([
+            _assistant_line(0, input_tokens=0),
+            _assistant_line(60_000),
+            _assistant_line(120_000),
+        ])
+        try:
+            first, _last = gauge.scan_usage(path)
+            self.assertEqual(gauge.compute_fill(first), 60_002)
+        finally:
+            os.unlink(path)
+
+    def test_all_turns_aborted_says_nothing(self):
+        path = _write_transcript([
+            _assistant_line(0, input_tokens=0),
+            _assistant_line(0, input_tokens=0),
+        ])
+        try:
+            self.assertIsNone(gauge.reading_claude(path))
+        finally:
+            os.unlink(path)
+
+    def test_last_usage_far_from_eof_still_found(self):
+        path = _write_transcript([
+            _assistant_line(60_000),
+            _assistant_line(170_000),
+            _tool_result_line(800_000),
             _tool_result_line(10),
         ])
         try:
             first, last = gauge.scan_usage(path)
             self.assertIsNotNone(last)
             self.assertEqual(gauge.compute_fill(last), 170_002)
-            w, _t, _f = gauge.reading(path)
+            w, _t, _f, _win, _m = gauge.reading_claude(path)
             self.assertEqual(w, 110_000)
         finally:
             os.unlink(path)
 
 
-class TestHookModeFailOpen(unittest.TestCase):
-    """UserPromptSubmit path: every failure must be rc 0, never exit 2 (that erases the prompt)."""
+class TestGrokReading(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.floor_dir = Path(self._td.name)
+        # patch module floor dir
+        self._orig = gauge._floor_dir
+        gauge._floor_dir = lambda: self.floor_dir  # type: ignore
 
-    def test_valid_emits_envelope(self):
+    def tearDown(self):
+        gauge._floor_dir = self._orig  # type: ignore
+        self._td.cleanup()
+
+    def test_floor_sticky_and_growth(self):
+        sid = "sess-a"
+        sig = {
+            "contextTokensUsed": 100_000,
+            "contextWindowTokens": 500_000,
+            "primaryModelId": "grok-4.5",
+            "compactionCount": 0,
+            "turnCount": 1,
+        }
+        r1 = gauge.reading_grok_signals(sig, sid)
+        self.assertEqual(r1[0], 0)       # working
+        self.assertEqual(r1[2], 100_000)  # floor
+        r2 = gauge.reading_grok_signals({**sig, "contextTokensUsed": 160_000}, sid)
+        self.assertEqual(r2[0], 60_000)
+        self.assertEqual(r2[2], 100_000)
+        self.assertEqual(gauge.band_for(r2[0])[0], "YELLOW")
+
+    def test_compact_reseeds_floor(self):
+        sid = "sess-b"
+        gauge.reading_grok_signals({
+            "contextTokensUsed": 200_000,
+            "contextWindowTokens": 500_000,
+            "primaryModelId": "grok-4.5",
+            "compactionCount": 0,
+        }, sid)
+        r = gauge.reading_grok_signals({
+            "contextTokensUsed": 80_000,
+            "contextWindowTokens": 500_000,
+            "primaryModelId": "grok-4.5",
+            "compactionCount": 1,
+        }, sid)
+        self.assertEqual(r[0], 0)
+        self.assertEqual(r[2], 80_000)
+
+    def test_zero_fill_skipped(self):
+        self.assertIsNone(gauge.reading_grok_signals({
+            "contextTokensUsed": 0,
+            "contextWindowTokens": 500_000,
+        }, "sess-c"))
+
+
+class TestHookModeFailOpen(unittest.TestCase):
+    def test_claude_valid_emits_envelope(self):
         path = _write_transcript([_assistant_line(60_000), _assistant_line(163_000)])
         try:
             rc, out, _ = run({"transcript_path": path, "hook_event_name": "UserPromptSubmit"})
@@ -181,7 +271,62 @@ class TestHookModeFailOpen(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_grok_hook_envelope(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # fake grok sessions layout
+            sess = root / "sessions" / "home%2Fproj" / "sid-1"
+            sess.mkdir(parents=True)
+            (sess / "signals.json").write_text(json.dumps({
+                "contextTokensUsed": 100_000,
+                "contextWindowTokens": 500_000,
+                "primaryModelId": "grok-4.5",
+                "compactionCount": 0,
+            }))
+            # second turn growth: seed then grow via two runs with floor dir
+            floor_dir = root / "floors"
+            env = {
+                "GROK_HOME": str(root),
+                "CONTEXT_GAUGE_FLOOR_DIR": str(floor_dir),
+                "GROK_SESSION_ID": "sid-1",
+            }
+            rc, out, _ = run(
+                {"sessionId": "sid-1", "workspaceRoot": "/home/proj",
+                 "hookEventName": "user_prompt_submit"},
+                env_extra=env,
+            )
+            self.assertEqual(rc, 0)
+            # first observation → working 0, still emits
+            env1 = json.loads(out)
+            self.assertIn("CONTEXT FUEL", env1["hookSpecificOutput"]["additionalContext"])
+
+            (sess / "signals.json").write_text(json.dumps({
+                "contextTokensUsed": 160_000,
+                "contextWindowTokens": 500_000,
+                "primaryModelId": "grok-4.5",
+                "compactionCount": 0,
+            }))
+            rc2, out2, _ = run(
+                {"sessionId": "sid-1", "workspaceRoot": "/home/proj",
+                 "hookEventName": "UserPromptSubmit"},
+                env_extra=env,
+            )
+            self.assertEqual(rc2, 0)
+            ctx = json.loads(out2)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("YELLOW", ctx)
+            self.assertIn("60K working", ctx)
+
     def test_disable_emits_nothing(self):
+        path = _write_transcript([_assistant_line(163_000)])
+        try:
+            rc, out, _ = run({"transcript_path": path, "hook_event_name": "UserPromptSubmit"},
+                             env_extra={"CONTEXT_GAUGE_DISABLE": "1"})
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.strip(), "")
+        finally:
+            os.unlink(path)
+
+    def test_legacy_disable_alias(self):
         path = _write_transcript([_assistant_line(163_000)])
         try:
             rc, out, _ = run({"transcript_path": path, "hook_event_name": "UserPromptSubmit"},
@@ -221,8 +366,6 @@ class TestHookModeFailOpen(unittest.TestCase):
 
 
 class TestStatuslineMode(unittest.TestCase):
-    """statusLine path: renders a band segment; fail-open to a blank/minimal bar."""
-
     def test_renders_band_and_model(self):
         path = _write_transcript([_assistant_line(60_000), _assistant_line(163_000)])
         try:
@@ -238,7 +381,7 @@ class TestStatuslineMode(unittest.TestCase):
         try:
             rc, out, _ = run({"transcript_path": path, "model": {"display_name": "Opus 4.8"}})
             self.assertEqual(rc, 0)
-            self.assertIn("Opus 4.8", out)   # neutral bar still shows model
+            self.assertIn("Opus 4.8", out)
             self.assertNotIn("ORANGE", out)
         finally:
             os.unlink(path)
@@ -247,7 +390,7 @@ class TestStatuslineMode(unittest.TestCase):
         path = _write_transcript([_assistant_line(60_000), _assistant_line(163_000)])
         try:
             rc, out, _ = run({"transcript_path": path, "model": {"display_name": "Opus 4.8"}},
-                             env_extra={"CLAUDE_CONTEXT_GAUGE_DISABLE": "1"})
+                             env_extra={"CONTEXT_GAUGE_DISABLE": "1"})
             self.assertEqual(rc, 0)
             self.assertNotIn("ORANGE", out)
             self.assertIn("Opus 4.8", out)
