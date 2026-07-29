@@ -53,14 +53,30 @@ The window size only feeds a secondary auto-compaction-proximity `%` (cosmetic).
 
 ## Install
 
-Requires **Python 3** (stdlib only).
+Requires **Python 3** (stdlib only — no third-party deps).
+
+### One-liner (`uvx` / `pip`)
+
+```sh
+# run without installing
+uvx --from git+https://github.com/jkubo/context-gauge context-gauge --self-test
+
+# install as a user tool
+uv tool install git+https://github.com/jkubo/context-gauge
+# after PyPI publish:
+# uvx context-gauge --self-test
+# uv tool install context-gauge
+# pipx install context-gauge
+```
+
+### From a clone
 
 ```sh
 git clone https://github.com/jkubo/context-gauge
 cd context-gauge
 ./install.sh          # → ~/.local/bin/context-gauge (+ claude-context-gauge shim)
+# or: pip install -e .   /   uv tool install .
 ```
-
 ### Claude Code
 
 Merge into `~/.claude/settings.json` (see [`settings.example.json`](settings.example.json)):
@@ -146,6 +162,14 @@ python3 -m pytest tests/ -v
 python3 -m unittest tests.test_gauge -v
 ```
 
+## Packaging / release
+
+```sh
+uv build                    # → dist/*.whl + dist/*.tar.gz
+uv publish                  # needs UV_PUBLISH_TOKEN / PyPI trusted publisher
+```
+
+Entry points: `context-gauge` and `claude-context-gauge` (shim) → `context_gauge:main`.
 ---
 
 ## License

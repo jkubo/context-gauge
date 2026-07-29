@@ -18,7 +18,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.join(os.path.dirname(HERE), "context-gauge")
+SCRIPT = os.path.join(os.path.dirname(HERE), "context_gauge.py")
 
 _loader = SourceFileLoader("cg", SCRIPT)
 _spec = importlib.util.spec_from_loader("cg", _loader)

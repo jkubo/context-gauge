@@ -4,9 +4,11 @@ DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ -x "$DIR/context-gauge" ]; then
   exec "$DIR/context-gauge" "$@"
 fi
-# installed as ~/.local/bin/claude-context-gauge with sibling context-gauge
-if [ -x "$(dirname -- "$0")/context-gauge" ]; then
-  exec "$(dirname -- "$0")/context-gauge" "$@"
+if [ -f "$DIR/context_gauge.py" ]; then
+  exec python3 "$DIR/context_gauge.py" "$@"
+fi
+if command -v context-gauge >/dev/null 2>&1; then
+  exec context-gauge "$@"
 fi
 echo "context-gauge not found next to claude-context-gauge shim" >&2
 exit 0

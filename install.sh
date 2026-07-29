@@ -4,18 +4,21 @@
 set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-SRC="${ROOT}/context-gauge"
+# Prefer the .py module (packaging source of truth); fall back to wrapper name.
+if [ -f "${ROOT}/context_gauge.py" ]; then
+  SRC="${ROOT}/context_gauge.py"
+elif [ -f "${ROOT}/context-gauge" ]; then
+  SRC="${ROOT}/context-gauge"
+else
+  echo "error: context_gauge.py missing in $ROOT" >&2
+  exit 1
+fi
 DEST_DIR="${HOME}/.local/bin"
 DEST="${DEST_DIR}/context-gauge"
 SHIM="${DEST_DIR}/claude-context-gauge"
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "warning: python3 not found on PATH — the gauge needs it at runtime." >&2
-fi
-
-if [ ! -f "$SRC" ]; then
-  echo "error: $SRC missing" >&2
-  exit 1
 fi
 
 mkdir -p "$DEST_DIR"
@@ -33,7 +36,7 @@ case ":${PATH}:" in
   *) echo "note: ${DEST_DIR} is not on your PATH — add it, or use the absolute path below." >&2 ;;
 esac
 
-cat <<EOF
+cat <<EOM
 
 Quick check:
   $DEST --self-test
@@ -65,4 +68,11 @@ Quick check:
   }
 
 See settings.example.json and hooks.grok.example.json.
-EOF
+
+── uvx / pip (no local clone) ──
+
+  uvx --from git+https://github.com/jkubo/context-gauge context-gauge --self-test
+  # or after PyPI publish:
+  # uvx context-gauge --self-test
+  # uv tool install context-gauge
+EOM
