@@ -51,6 +51,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 import sys
 import time
 from pathlib import Path
@@ -103,18 +105,50 @@ def _claude_window() -> int:
         return DEFAULT_CLAUDE_WINDOW
 
 
+# Session ids are attacker-adjacent: they name a cache file and a session dir.
+# Allowlist, never blocklist — anything outside this charset is refused outright
+# rather than sanitized, so no traversal (`..`, `/`, NUL) can reach a path join.
+_SAFE_SESSION_ID = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
+
+
+def safe_session_id(session_id) -> str:
+    """Return the id if it is safe to use as a path component, else ""."""
+    sid = str(session_id or "")
+    if sid in (".", "..") or not _SAFE_SESSION_ID.match(sid):
+        return ""
+    return sid
+
+
+# The model name comes out of signals.json and is rendered straight into the
+# text injected into the model's context every turn. Treat it as untrusted:
+# a newline or bracket there could forge structure in the injected line.
+_SAFE_MODEL = re.compile(r"[^A-Za-z0-9._:/ -]")
+
+
+def safe_model(model) -> str:
+    """Model id reduced to a harmless charset, length-capped."""
+    return _SAFE_MODEL.sub("", str(model or "")).strip()[:64]
+
+
+def _env_path(*names, default=""):
+    """First non-empty env var among names, ~-expanded. Empty string ≠ set."""
+    for name in names:
+        val = os.environ.get(name)
+        if val:
+            return os.path.expanduser(val)
+    return os.path.expanduser(default)
+
+
 def _floor_dir() -> Path:
-    return Path(os.environ.get(
+    return Path(_env_path(
         "CONTEXT_GAUGE_FLOOR_DIR",
-        os.environ.get(
-            "GAIUS_GROK_FLOOR_DIR",  # kub0/gaius compat
-            os.path.expanduser("~/.context-gauge/floors"),
-        ),
+        "GAIUS_GROK_FLOOR_DIR",  # kub0/gaius compat
+        default="~/.context-gauge/floors",
     ))
 
 
 def _grok_home() -> Path:
-    return Path(os.environ.get("GROK_HOME", os.path.expanduser("~/.grok")))
+    return Path(_env_path("GROK_HOME", default="~/.grok"))
 
 
 def _fmt_k(n) -> str:
@@ -155,10 +189,19 @@ def _is_main_assistant_usage(obj):
 
 
 def scan_usage(transcript_path):
+    """Scan a Claude transcript for first/last main-assistant usage.
+
+    Fail-open on anything that is not a regular file: a character device
+    (``/dev/zero``), FIFO, or socket can hang forever on a blocking read.
+    ``getsize`` alone is not enough — those report size 0.
+    """
     try:
-        size = os.path.getsize(transcript_path)
+        st = os.stat(transcript_path)
     except OSError:
         return None, None
+    if not stat.S_ISREG(st.st_mode):
+        return None, None
+    size = st.st_size
 
     first = last = None
     try:
@@ -216,9 +259,16 @@ def reading_claude(transcript_path):
     return working, total, floor, _claude_window(), ""
 
 
+# Back-compat: pre-rename consumers import this module and call reading().
+# gaius/marathon.py is one such caller. Keep the alias so the unified module is
+# a drop-in for anything still on the old name.
+reading = reading_claude
+
+
 # ── Grok: signals.json ────────────────────────────────────────────────────────
 
 def session_dir_for(session_id: str, workspace: str | None):
+    session_id = safe_session_id(session_id)
     if not session_id:
         return None
     sessions = _grok_home() / "sessions"
@@ -244,30 +294,58 @@ def load_signals(session_dir: Path):
         return None
 
 
-def _floor_path(session_id: str) -> Path:
-    return _floor_dir() / f"{session_id}.json"
+def _floor_path(session_id: str):
+    """Cache path for a session floor, or None if the id is not path-safe."""
+    sid = safe_session_id(session_id)
+    if not sid:
+        return None
+    return _floor_dir() / f"{sid}.json"
 
 
 def load_floor(session_id: str):
+    path = _floor_path(session_id)
+    if path is None:
+        return None
     try:
-        return json.loads(_floor_path(session_id).read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, UnicodeDecodeError):
         return None
 
 
 def save_floor(session_id: str, floor: int, window: int, model: str, compaction_count: int):
+    path = _floor_path(session_id)
+    if path is None:
+        return
+    payload = json.dumps({
+        "floor": int(floor),
+        "window": int(window),
+        "model": model or "",
+        "compaction_count": int(compaction_count or 0),
+        "seeded_at": time.time(),
+    }, indent=2) + "\n"
     try:
-        _floor_dir().mkdir(parents=True, exist_ok=True)
-        _floor_path(session_id).write_text(
-            json.dumps({
-                "floor": int(floor),
-                "window": int(window),
-                "model": model or "",
-                "compaction_count": int(compaction_count or 0),
-                "seeded_at": time.time(),
-            }, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        d = _floor_dir()
+        # 0o700 survives any umask (umask only clears bits), so a dir we create
+        # is private by construction. An older 0755 dir is tightened in place.
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+        # Create with 0o600 up front — an open()-then-chmod() leaves the file
+        # world-readable for the width of the write.
+        # O_NOFOLLOW: never write through a symlink planted in the cache dir —
+        # and never chmod its target. Falls back to a plain refusal, not a write.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(path), flags, 0o600)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+            try:
+                os.fchmod(fd, 0o600)  # normalize files left 0644 by older versions
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
     except OSError:
         pass
 
@@ -296,7 +374,7 @@ def reading_grok_signals(sig: dict, session_id: str):
         return None
     window = int(sig.get("contextWindowTokens") or 0) or DEFAULT_GROK_WINDOW
     models = sig.get("modelsUsed") or []
-    model = str(sig.get("primaryModelId") or (models[0] if models else "") or "")
+    model = safe_model(sig.get("primaryModelId") or (models[0] if models else ""))
     cc = int(sig.get("compactionCount") or 0)
     floor = resolve_floor(session_id, total, window, model, cc)
     working = max(0, total - floor)
@@ -332,13 +410,56 @@ def gauge_line(working, total, floor, window=None, model=""):
     )
 
 
-def emit_hook(text: str):
-    sys.stdout.write(json.dumps({
+def _safe_write(text: str, trailing_newline: bool = True) -> None:
+    """Write to stdout without raising on encoding failure.
+
+    Under ``PYTHONIOENCODING=ascii`` (or any narrow locale), emoji and other
+    non-ASCII in the statusLine / hook payload would otherwise raise
+    ``UnicodeEncodeError`` and the outer fail-open catch would swallow it into
+    a silent blank line. Prefer the stream's own encoding with replacement so
+    the band name and model still render; fall back to the binary buffer.
+    """
+    out = text
+    if trailing_newline and not out.endswith("\n"):
+        out = out + "\n"
+    try:
+        sys.stdout.write(out)
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        return
+    except UnicodeEncodeError:
+        pass
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    data = out.encode(enc, errors="replace")
+    buf = getattr(sys.stdout, "buffer", None)
+    if buf is not None:
+        try:
+            buf.write(data)
+            buf.flush()
+            return
+        except Exception:
+            pass
+    try:
+        sys.stdout.write(out.encode("ascii", errors="replace").decode("ascii"))
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def emit_hook(text: str, event: str = "UserPromptSubmit"):
+    # Echo the event we were actually invoked for — a SessionStart inject that
+    # claims to be UserPromptSubmit can be dropped or misrouted by the harness.
+    # ensure_ascii=False keeps real emoji for UTF-8 consumers; _safe_write
+    # degrades under ascii locales instead of blanking the hook.
+    payload = json.dumps({
         "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
+            "hookEventName": event or "UserPromptSubmit",
             "additionalContext": text,
         }
-    }))
+    }, ensure_ascii=False)
+    _safe_write(payload)
 
 
 def band_segment(working):
@@ -366,25 +487,48 @@ def statusline_claude(transcript_path, model=""):
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
 
-def _is_hook_event(data: dict) -> bool:
-    name = (data.get("hook_event_name") or data.get("hookEventName") or "").lower()
-    # Claude: UserPromptSubmit. Grok: user_prompt_submit / session_start / post_compact.
-    return name in (
-        "userpromptsubmit", "user_prompt_submit",
-        "sessionstart", "session_start",
-        "postcompact", "post_compact",
+# Claude sends CamelCase event names; Grok sends snake_case. Match both, and
+# canonicalize so the echoed hookEventName is always harness-legal.
+_EVENT_ALIASES = {
+    "userpromptsubmit": "UserPromptSubmit",
+    "user_prompt_submit": "UserPromptSubmit",
+    "sessionstart": "SessionStart",
+    "session_start": "SessionStart",
+    "postcompact": "PostCompact",
+    "post_compact": "PostCompact",
+}
+
+
+def _event_name(data: dict) -> str:
+    """Canonical hook event name, or "" if this payload is not a hook event."""
+    raw = (
+        data.get("hook_event_name")
+        or data.get("hookEventName")
+        or data.get("event")
+        or ""
     )
+    return _EVENT_ALIASES.get(str(raw).strip().lower(), "")
+
+
+def _is_hook_event(data: dict) -> bool:
+    return bool(_event_name(data))
 
 
 def _looks_like_grok(data: dict) -> bool:
+    """A Grok envelope never carries a Claude transcript path.
+
+    Claude sends session_id on BOTH its hook and its statusLine payload, so
+    keying on session_id alone routes every statusLine render down the hook
+    path and prints raw JSON into the status bar. transcript_path is the
+    reliable discriminator; check it first.
+    """
+    if data.get("transcript_path") or data.get("transcriptPath"):
+        return False
     if data.get("sessionId") or data.get("session_id"):
         return True
-    if os.environ.get("GROK_SESSION_ID"):
+    if data.get("workspaceRoot") or data.get("workspace_root"):
         return True
-    # Grok hook envelopes are camelCase and never carry transcript_path.
-    if data.get("workspaceRoot") and not data.get("transcript_path"):
-        return True
-    return False
+    return bool(os.environ.get("GROK_SESSION_ID"))
 
 
 def main() -> int:
@@ -453,7 +597,8 @@ def main() -> int:
         print("")
         return 0
 
-    is_hook = _is_hook_event(data)
+    event = _event_name(data)
+    is_hook = bool(event)
     is_grok = _looks_like_grok(data)
     tp = data.get("transcript_path") or data.get("transcriptPath") or ""
 
@@ -483,7 +628,7 @@ def main() -> int:
                 r = reading_claude(tp)
             if r is None:
                 return 0
-            emit_hook(gauge_line(*r))
+            emit_hook(gauge_line(*r), event)
         except Exception:
             pass
         return 0
@@ -491,12 +636,9 @@ def main() -> int:
     # Claude statusLine mode (stdin is statusLine payload, not a hook)
     try:
         model = (data.get("model") or {}).get("display_name", "")
-        print(statusline_claude(tp, model))
+        _safe_write(statusline_claude(tp, model))
     except Exception:
-        try:
-            print("")
-        except Exception:
-            pass
+        _safe_write("")
     return 0
 
 
