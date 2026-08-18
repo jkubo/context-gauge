@@ -52,6 +52,7 @@ CONFIG (optional env vars):
   CLAUDE_CONTEXT_GAUGE_WINDOW    legacy alias
   CONTEXT_GAUGE_FLOOR_DIR        Grok floor cache dir (default ~/.context-gauge/floors)
   CONTEXT_GAUGE_CHILDREN         0/false/off → hide the tessera children strip
+  CONTEXT_GAUGE_CHILDREN_ALL     1/true/on → disable the session filter (show every live tessera)
   CONTEXT_GAUGE_TESSERA_ROOT     test-only override of ~/.gaius/tessera
   CONTEXT_GAUGE_SAMPLES          sample log (default ~/.context-gauge/samples.jsonl)
   CONTEXT_GAUGE_NO_SAMPLES       any truthy → collect nothing
@@ -965,6 +966,10 @@ def _looks_like_grok(data: dict) -> bool:
 # ── tessera children strip (statusLine extra rows) ────────────────────────────
 # Still-running ⇔ live/<id>.ndjson exists AND raw/<id>.json does not.
 # Discovery is two os.listdir calls. Never open, stat, or read an ndjson.
+# Session scope (optional): join that id to ledger.jsonl issue.visa and keep
+# the row only when issue.manager_session matches CLAUDE_CODE_SESSION_ID.
+# Both sides of the compare go through safe_session_id. The field is never
+# printed; displayed shorts stay the last 6 of an already-_SAFE_TID id.
 
 _SAFE_TID = re.compile(r"\A[TV]-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\Z")
 CHILDREN_MAX = 4
@@ -983,6 +988,81 @@ def _tessera_root() -> Path:
 def _children_disabled() -> bool:
     raw = os.environ.get("CONTEXT_GAUGE_CHILDREN", "1")
     return str(raw).strip().lower() in {"0", "false", "no", "off"}
+
+
+def _children_all() -> bool:
+    raw = os.environ.get("CONTEXT_GAUGE_CHILDREN_ALL", "")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _issue_manager_sessions(root: Path) -> dict[str, str] | None:
+    """visa → sanitized manager_session for each ledger issue row.
+
+    Last issue row per visa wins. None means the ledger could not be opened
+    as a regular file (caller fail-opens and shows every running id). A
+    missing ledger is an empty map: nothing is attributed.
+    ``manager_session`` is executor-adjacent once it is copied into this
+    process; it is reduced with safe_session_id and never rendered.
+    """
+    path = root / "ledger.jsonl"
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    owned = True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        out: dict[str, str] = {}
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+            owned = False
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict) or obj.get("kind") != "issue":
+                    continue
+                visa = obj.get("visa")
+                if not isinstance(visa, str) or not _SAFE_TID.match(visa):
+                    continue
+                out[visa] = safe_session_id(obj.get("manager_session") or "")
+        return out
+    except OSError:
+        return None
+    finally:
+        if owned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _filter_running_to_session(running: list[str], root: Path) -> list[str]:
+    """Keep tids whose issue.manager_session is this Claude session.
+
+    Unset / unsafe CLAUDE_CODE_SESSION_ID, or CONTEXT_GAUGE_CHILDREN_ALL,
+    leaves the list unchanged (today's unscoped strip). An unreadable
+    ledger also fail-opens. When the filter is armed, a tid with no issue
+    row or no usable manager_session is dropped.
+    """
+    if not running or _children_all():
+        return running
+    want = safe_session_id(os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
+    if not want:
+        return running
+    owners = _issue_manager_sessions(root)
+    if owners is None:
+        return running
+    return [tid for tid in running if owners.get(tid) == want]
 
 
 def list_running_tesserae(root: Path | None = None) -> list[str]:
@@ -1022,7 +1102,8 @@ def list_running_tesserae(root: Path | None = None) -> list[str]:
 
 def children_lines(root: Path | None = None) -> list[str]:
     """Zero or one extra statusLine row. Empty when there is nothing to show."""
-    running = list_running_tesserae(root)
+    root = _tessera_root() if root is None else root
+    running = _filter_running_to_session(list_running_tesserae(root), root)
     if not running:
         return []
     shown = running[:CHILDREN_MAX]

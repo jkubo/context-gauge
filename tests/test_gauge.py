@@ -72,6 +72,10 @@ def run(stdin_obj=None, extra_args=None, env_extra=None, raw_stdin=None):
     # Existing statusLine tests must not pick up the operator's real
     # ~/.gaius/tessera (which may have live units). Opt in via env_extra.
     env.setdefault("CONTEXT_GAUGE_TESSERA_ROOT", "/no/such/tessera-root-for-tests")
+    # Session filter is fail-open when this is unset. A live Claude session
+    # would otherwise hide fixtures that have no ledger issue.manager_session.
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    env.pop("CONTEXT_GAUGE_CHILDREN_ALL", None)
     if env_extra:
         env.update(env_extra)
     cmd = [sys.executable, SCRIPT] + (extra_args or [])
@@ -1117,7 +1121,7 @@ class TestFittedThresholds(unittest.TestCase):
 class TestTesseraChildren(unittest.TestCase):
     """Foreign-family strip: directory names only, never ndjson bodies."""
 
-    def _tree(self, live_ndjson=(), live_other=(), raw_json=()):
+    def _tree(self, live_ndjson=(), live_other=(), raw_json=(), issues=()):
         td = tempfile.mkdtemp(prefix="gauge-tessera-")
         live = Path(td) / "live"
         raw = Path(td) / "raw"
@@ -1129,12 +1133,27 @@ class TestTesseraChildren(unittest.TestCase):
             (live / name).write_text("x", encoding="utf-8")
         for tid in raw_json:
             (raw / f"{tid}.json").write_text("{}", encoding="utf-8")
+        if issues:
+            rows = []
+            for iss in issues:
+                row = {"kind": "issue", "v": 1}
+                row.update(iss)
+                rows.append(json.dumps(row))
+            (Path(td) / "ledger.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
         return td
+
+    def setUp(self):
+        # Inherited Claude env must not arm the session filter for the
+        # discovery tests below (unset session id = today's unscoped strip).
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        os.environ.pop("CONTEXT_GAUGE_CHILDREN_ALL", None)
 
     def tearDown(self):
         os.environ.pop("CONTEXT_GAUGE_TESSERA_ROOT", None)
         os.environ.pop("CONTEXT_GAUGE_CHILDREN", None)
+        os.environ.pop("CONTEXT_GAUGE_CHILDREN_ALL", None)
         os.environ.pop("CONTEXT_GAUGE_DISABLE", None)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
 
     def test_running_is_live_ndjson_minus_raw_json(self):
         a = "T-20260818-010837-9ee4a0"
@@ -1286,6 +1305,91 @@ class TestTesseraChildren(unittest.TestCase):
             elapsed = __import__("time").monotonic() - t0
             self.assertEqual(ids, [tid])
             self.assertLess(elapsed, 1.0)
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def _session_tree(self):
+        mine = "T-20260818-010800-aaaaa1"
+        other = "T-20260818-010801-bbbbb2"
+        orphan = "T-20260818-010802-ccccc3"
+        bare = "T-20260818-010803-ddddd4"
+        poison = "T-20260818-010804-eeeeee"
+        td = self._tree(
+            live_ndjson=(mine, other, orphan, bare, poison),
+            issues=(
+                {"visa": mine, "manager_session": "sess-mine"},
+                {"visa": other, "manager_session": "sess-other"},
+                {"visa": bare, "unit": "no-session-field"},
+                {"visa": poison, "manager_session": "\x1b]0;pwned\x07"},
+            ),
+        )
+        return td, mine, other, orphan, bare, poison
+
+    def test_session_filter_keeps_only_this_manager(self):
+        td, mine, other, orphan, bare, poison = self._session_tree()
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-mine"
+        try:
+            running = gauge.list_running_tesserae(Path(td))
+            self.assertEqual(len(running), 5, "discovery stays unscoped")
+            lines = gauge.children_lines(Path(td))
+            self.assertEqual(len(lines), 1)
+            self.assertIn("1 tessera", lines[0])
+            self.assertIn("aaaaa1", lines[0])
+            self.assertNotIn("bbbbb2", lines[0])
+            self.assertNotIn("ccccc3", lines[0])
+            self.assertNotIn("ddddd4", lines[0])
+            self.assertNotIn("eeeeee", lines[0])
+            self.assertNotIn("pwned", lines[0])
+            self.assertNotIn("MUST-NOT-BE-READ", lines[0])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_session_filter_off_via_env(self):
+        td, mine, other, orphan, bare, poison = self._session_tree()
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-mine"
+        os.environ["CONTEXT_GAUGE_CHILDREN_ALL"] = "1"
+        try:
+            lines = gauge.children_lines(Path(td))
+            self.assertEqual(len(lines), 1)
+            self.assertIn("5 tesserae", lines[0])
+            # newest-first, cap 4: eeeeee..bbbbb2 shown; aaaaa1 in +1 overflow
+            self.assertIn("eeeeee", lines[0])
+            self.assertIn("bbbbb2", lines[0])
+            self.assertIn("+1", lines[0])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_session_filter_unset_session_id_shows_all(self):
+        td, mine, other, orphan, bare, poison = self._session_tree()
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        try:
+            lines = gauge.children_lines(Path(td))
+            self.assertEqual(len(lines), 1)
+            self.assertIn("5 tesserae", lines[0])
+            self.assertIn("eeeeee", lines[0])
+            self.assertIn("bbbbb2", lines[0])
+            self.assertIn("+1", lines[0])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_session_filter_drops_unattributed(self):
+        td, mine, other, orphan, bare, poison = self._session_tree()
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-mine"
+        try:
+            lines = gauge.children_lines(Path(td))
+            body = lines[0] if lines else ""
+            # orphan: live file, no issue row
+            self.assertNotIn("ccccc3", body)
+            # bare: issue row, no manager_session key
+            self.assertNotIn("ddddd4", body)
+            # poison: issue row, manager_session fails safe_session_id
+            self.assertNotIn("eeeeee", body)
+            self.assertNotIn("pwned", body)
+            self.assertIn("aaaaa1", body)
         finally:
             import shutil
             shutil.rmtree(td)
