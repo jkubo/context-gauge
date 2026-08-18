@@ -20,6 +20,13 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(os.path.dirname(HERE), "context_gauge.py")
 
+# A published fit lives at ~/.context-gauge/thresholds.json and legitimately moves
+# every band. Tests assert against the SHIPPED defaults, so they must not read the
+# operator's fit — point the whole suite at a path that cannot exist. (Found the
+# hard way: applying a real fit turned 8 green tests red.)
+NO_THRESHOLDS = os.path.join(tempfile.gettempdir(), "context-gauge-tests-absent.json")
+os.environ["CONTEXT_GAUGE_THRESHOLDS"] = NO_THRESHOLDS
+
 _loader = SourceFileLoader("cg", SCRIPT)
 _spec = importlib.util.spec_from_loader("cg", _loader)
 gauge = importlib.util.module_from_spec(_spec)
@@ -58,6 +65,13 @@ def _write_transcript(lines):
 
 def run(stdin_obj=None, extra_args=None, env_extra=None, raw_stdin=None):
     env = dict(os.environ)
+    # Synthetic transcripts must never enter the real calibration corpus —
+    # a 300K fixture row would skew the very distribution we sample to tune
+    # thresholds. Sampling tests opt back in with CONTEXT_GAUGE_NO_SAMPLES="".
+    env["CONTEXT_GAUGE_NO_SAMPLES"] = "1"
+    # Existing statusLine tests must not pick up the operator's real
+    # ~/.gaius/tessera (which may have live units). Opt in via env_extra.
+    env.setdefault("CONTEXT_GAUGE_TESSERA_ROOT", "/no/such/tessera-root-for-tests")
     if env_extra:
         env.update(env_extra)
     cmd = [sys.executable, SCRIPT] + (extra_args or [])
@@ -745,6 +759,536 @@ class TestNoDivergence(unittest.TestCase):
                              "wrapper and module disagree — they have diverged")
         finally:
             os.unlink(path)
+
+
+class TestDynamicWindow(unittest.TestCase):
+    """The denominator is read from the harness, never assumed.
+
+    The gauge hardcoded 200_000 while live Opus 5 sessions ran a 1M window: a
+    112K fill rendered as "56% of 200K" instead of 11% of 1M, and the
+    compaction warning armed at 16% full.
+    """
+
+    def test_window_from_payload_shapes(self):
+        cases = [
+            ({"context_window": {"context_window_size": 1_000_000}}, 1_000_000),
+            ({"context_window": {"contextWindowSize": 500_000}}, 500_000),
+            ({"context_window": 200_000}, 200_000),
+            ({"context_window_size": 300_000}, 300_000),
+            ({"context_window": {"context_window_size": 0}}, None),
+            ({"context_window": {"context_window_size": "nope"}}, None),
+            ({"context_window": None}, None),
+            ({}, None),
+            ("not a dict", None),
+        ]
+        for payload, expect in cases:
+            with self.subTest(payload=payload):
+                self.assertEqual(gauge.window_from_payload(payload), expect)
+
+    def test_statusline_uses_the_reported_window(self):
+        path = _write_transcript([_assistant_line(60_000), _assistant_line(120_000)])
+        try:
+            rc, out, _ = run({"transcript_path": path,
+                              "model": {"display_name": "Opus 5"},
+                              "context_window": {"context_window_size": 1_000_000}})
+            self.assertEqual(rc, 0)
+            self.assertIn("of 1M", out)
+            self.assertNotIn("200K", out)
+        finally:
+            os.unlink(path)
+
+    def test_unreported_window_skips_the_ratio_entirely(self):
+        # A guessed denominator must not render a percentage OR set a band.
+        path = _write_transcript([_assistant_line(60_000), _assistant_line(120_000)])
+        try:
+            rc, out, _ = run({"transcript_path": path, "model": {"display_name": "Opus 5"}})
+            self.assertEqual(rc, 0)
+            self.assertNotIn("% of", out)
+        finally:
+            os.unlink(path)
+
+    def test_env_pin_beats_the_reported_window(self):
+        os.environ.pop("CONTEXT_GAUGE_WINDOW", None)
+        self.assertEqual(gauge.resolve_claude_window(1_000_000), (1_000_000, True))
+        os.environ["CONTEXT_GAUGE_WINDOW"] = "250000"
+        try:
+            self.assertEqual(gauge.resolve_claude_window(1_000_000), (250_000, True))
+        finally:
+            os.environ.pop("CONTEXT_GAUGE_WINDOW", None)
+
+    def test_default_is_flagged_as_a_guess(self):
+        os.environ.pop("CONTEXT_GAUGE_WINDOW", None)
+        window, known = gauge.resolve_claude_window(None)
+        self.assertEqual(window, gauge.DEFAULT_CLAUDE_WINDOW)
+        self.assertFalse(known, "the fallback must never be presented as measured")
+
+
+class TestWorseOfBands(unittest.TestCase):
+    """Colour = max(working-set band, window-ratio band)."""
+
+    def test_ratio_escalates_when_the_window_is_small(self):
+        # 120K working is ORANGE alone, but it is 90% of a 200K window.
+        self.assertEqual(gauge.band_for(120_000)[0], "ORANGE")
+        name, _e, _a, source, frac = gauge.resolve_band(120_000, 180_000, 200_000)
+        self.assertEqual(name, "RED")
+        self.assertEqual(source, "window ratio")
+        self.assertAlmostEqual(frac, 0.9)
+
+    def test_absolute_still_fires_on_a_huge_window(self):
+        # The regression this design exists to prevent: 190K working is 19% of
+        # a 1M window, so a ratio-only gauge calls it GREEN — at exactly the
+        # point where measured reasoning degradation is worst.
+        name, _e, _a, source, _f = gauge.resolve_band(190_000, 260_000, 1_000_000)
+        self.assertEqual(name, "RED")
+        self.assertEqual(source, "working set")
+
+    def test_unknown_window_falls_back_to_absolute_only(self):
+        name, _e, _a, source, frac = gauge.resolve_band(120_000, 180_000, None)
+        self.assertEqual(name, "ORANGE")
+        self.assertEqual(source, "working set")
+        self.assertIsNone(frac)
+
+    def test_ratio_boundaries(self):
+        cases = [(0.001, "GREEN"), (0.499, "GREEN"), (0.50, "YELLOW"),
+                 (0.699, "YELLOW"), (0.70, "ORANGE"), (0.849, "ORANGE"),
+                 (0.85, "RED"), (0.949, "RED"), (0.95, "BLACK"), (1.5, "BLACK")]
+        for frac, expect in cases:
+            with self.subTest(frac=frac):
+                name, _e, _a, _s, _f = gauge.resolve_band(0, int(frac * 1_000_000), 1_000_000)
+                self.assertEqual(name, expect)
+
+
+class TestWindowCache(unittest.TestCase):
+    """The statusLine is handed a window; the hook may not be. The cache bridges."""
+
+    def test_statusline_seeds_the_window_for_a_later_hook(self):
+        with tempfile.TemporaryDirectory() as floors:
+            env = {"CONTEXT_GAUGE_FLOOR_DIR": floors}
+            path = _write_transcript([_assistant_line(60_000), _assistant_line(120_000)])
+            sid = "cache-seed-1"
+            try:
+                rc, out, _ = run({"session_id": sid, "transcript_path": path,
+                                  "model": {"display_name": "Opus 5"},
+                                  "context_window": {"context_window_size": 1_000_000}},
+                                 env_extra=env)
+                self.assertEqual(rc, 0)
+                self.assertIn("of 1M", out)
+
+                # Hook payload carries no context_window — it must still say 1M.
+                rc, out, _ = run({"hook_event_name": "UserPromptSubmit",
+                                  "session_id": sid, "transcript_path": path},
+                                 env_extra=env)
+                self.assertEqual(rc, 0)
+                injected = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("of 1M window", injected)
+            finally:
+                os.unlink(path)
+
+    def test_window_cache_is_private_and_refuses_traversal(self):
+        with tempfile.TemporaryDirectory() as base:
+            floors = os.path.join(base, "floors")
+            canary = Path(base) / "CANARY.window.json"
+            os.environ["CONTEXT_GAUGE_FLOOR_DIR"] = floors
+            try:
+                gauge.save_window("../CANARY", 1_000_000)
+                self.assertFalse(canary.exists(), "traversal escaped the cache dir")
+                gauge.save_window("win-perm", 1_000_000)
+                self.assertEqual(os.stat(floors).st_mode & 0o777, 0o700)
+                self.assertEqual(
+                    os.stat(gauge._window_cache_path("win-perm")).st_mode & 0o777, 0o600)
+                self.assertEqual(gauge.load_window("win-perm"), 1_000_000)
+            finally:
+                os.environ.pop("CONTEXT_GAUGE_FLOOR_DIR", None)
+
+    def test_a_corrupt_cache_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as floors:
+            os.environ["CONTEXT_GAUGE_FLOOR_DIR"] = floors
+            try:
+                gauge._window_cache_path("junk").write_text("{not json", encoding="utf-8")
+                self.assertIsNone(gauge.load_window("junk"))
+                self.assertEqual(gauge.resolve_claude_window(None, "junk")[1], False)
+            finally:
+                os.environ.pop("CONTEXT_GAUGE_FLOOR_DIR", None)
+
+
+class TestBandFlags(unittest.TestCase):
+    """The flag names the remedy, and the remedy depends on WHICH axis fired.
+
+    118K working on a 1M window is 20% full: "handoff soon" contradicted the
+    band's own advice ("checkpoint soon"). It was only ever right because on a
+    200K window a 118K working set IS 97% full.
+    """
+
+    def test_orange_by_working_set_says_checkpoint_not_handoff(self):
+        self.assertEqual(gauge.band_flag("ORANGE", "working set"), "⚑ checkpoint")
+
+    def test_orange_by_window_ratio_says_compaction(self):
+        self.assertEqual(gauge.band_flag("ORANGE", "window ratio"), "⚑ compaction near")
+
+    def test_red_splits_by_axis(self):
+        self.assertEqual(gauge.band_flag("RED", "working set"), "⚑ handoff soon")
+        self.assertEqual(gauge.band_flag("RED", "window ratio"), "⚑ compaction imminent")
+
+    def test_black_is_terminal_on_either_axis(self):
+        for source in ("working set", "window ratio", "both"):
+            self.assertEqual(gauge.band_flag("BLACK", source), "⚑ HANDOFF NOW")
+
+    def test_green_and_yellow_are_unflagged(self):
+        self.assertEqual(gauge.band_flag("GREEN", "working set"), "")
+        self.assertEqual(gauge.band_flag("YELLOW", "both"), "")
+
+    def test_the_reported_case_no_longer_says_handoff(self):
+        # 118K working / 195K total / 1M window — the live bar that started this.
+        seg = gauge.band_segment(118_000, 195_000, 1_000_000)
+        self.assertIn("ORANGE", seg)
+        self.assertIn("20% of 1M", seg)
+        self.assertIn("checkpoint", seg)
+        self.assertNotIn("handoff", seg)
+
+
+class TestSampleCollection(unittest.TestCase):
+    """Raw numerics only — thresholds must be an OUTPUT of this data."""
+
+    def _env(self, base):
+        return {"CONTEXT_GAUGE_FLOOR_DIR": os.path.join(base, "floors"),
+                "CONTEXT_GAUGE_SAMPLES": os.path.join(base, "samples.jsonl"),
+                "CONTEXT_GAUGE_NO_SAMPLES": ""}
+
+    def test_a_live_statusline_records_both_axes(self):
+        with tempfile.TemporaryDirectory() as base:
+            env = self._env(base)
+            path = _write_transcript([_assistant_line(60_000), _assistant_line(180_000)])
+            try:
+                rc, _out, _ = run({"session_id": "sample-1", "transcript_path": path,
+                                   "model": {"display_name": "Opus 5"},
+                                   "effort": {"level": "xhigh"},
+                                   "context_window": {"context_window_size": 1_000_000}},
+                                  env_extra=env)
+                self.assertEqual(rc, 0)
+                rows = [json.loads(l) for l in
+                        Path(env["CONTEXT_GAUGE_SAMPLES"]).read_text().splitlines()]
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertEqual(row["working"], 120_000)   # reasoning axis
+                self.assertEqual(row["total"], 180_002)     # ratio numerator
+                self.assertEqual(row["window"], 1_000_000)  # ratio denominator
+                self.assertEqual(row["effort"], "xhigh")
+                self.assertEqual(row["harness"], "claude")
+            finally:
+                os.unlink(path)
+
+    def test_no_band_is_ever_persisted(self):
+        with tempfile.TemporaryDirectory() as base:
+            env = self._env(base)
+            path = _write_transcript([_assistant_line(60_000), _assistant_line(400_000)])
+            try:
+                run({"session_id": "sample-2", "transcript_path": path,
+                     "context_window": {"context_window_size": 200_000}}, env_extra=env)
+                body = Path(env["CONTEXT_GAUGE_SAMPLES"]).read_text()
+                for band in ("GREEN", "YELLOW", "ORANGE", "RED", "BLACK"):
+                    self.assertNotIn(band, body,
+                                     "a stored band would make recalibration circular")
+            finally:
+                os.unlink(path)
+
+    def test_rerenders_do_not_duplicate_a_turn(self):
+        with tempfile.TemporaryDirectory() as base:
+            env = self._env(base)
+            path = _write_transcript([_assistant_line(60_000), _assistant_line(180_000)])
+            payload = {"session_id": "sample-3", "transcript_path": path,
+                       "context_window": {"context_window_size": 1_000_000}}
+            try:
+                for _ in range(5):          # the statusLine renders constantly
+                    run(payload, env_extra=env)
+                rows = Path(env["CONTEXT_GAUGE_SAMPLES"]).read_text().splitlines()
+                self.assertEqual(len(rows), 1, "fill did not move; only one turn happened")
+            finally:
+                os.unlink(path)
+
+    def test_opt_out_collects_nothing(self):
+        with tempfile.TemporaryDirectory() as base:
+            env = self._env(base)
+            env["CONTEXT_GAUGE_NO_SAMPLES"] = "1"
+            path = _write_transcript([_assistant_line(60_000), _assistant_line(180_000)])
+            try:
+                run({"session_id": "sample-4", "transcript_path": path,
+                     "context_window": {"context_window_size": 1_000_000}}, env_extra=env)
+                self.assertFalse(Path(env["CONTEXT_GAUGE_SAMPLES"]).exists())
+            finally:
+                os.unlink(path)
+
+    def test_cli_inspection_of_a_foreign_transcript_does_not_sample(self):
+        with tempfile.TemporaryDirectory() as base:
+            env = self._env(base)
+            path = _write_transcript([_assistant_line(60_000), _assistant_line(180_000)])
+            try:
+                rc, _out, _ = run(None, extra_args=["--transcript", path], env_extra=env)
+                self.assertEqual(rc, 0)
+                self.assertFalse(Path(env["CONTEXT_GAUGE_SAMPLES"]).exists())
+            finally:
+                os.unlink(path)
+
+    def test_calibrate_reports_both_axes(self):
+        with tempfile.TemporaryDirectory() as base:
+            samples = os.path.join(base, "s.jsonl")
+            with open(samples, "w") as f:
+                for total in (100_000, 300_000, 700_000, 950_000):
+                    f.write(json.dumps({"ts": 1.0, "session": "s", "harness": "claude",
+                                        "working": total - 60_000, "total": total,
+                                        "floor": 60_000, "window": 1_000_000}) + "\n")
+            out = gauge.calibrate(samples)
+            self.assertIn("samples: 4", out)
+            self.assertIn("WORKING SET", out)
+            self.assertIn("WINDOW SATURATION", out)
+            self.assertIn("1M×4", out)
+
+    def test_calibrate_is_honest_about_an_empty_corpus(self):
+        with tempfile.TemporaryDirectory() as base:
+            out = gauge.calibrate(os.path.join(base, "missing.jsonl"))
+            self.assertIn("samples: 0", out)
+            self.assertIn("nothing collected yet", out)
+
+
+class TestFittedThresholds(unittest.TestCase):
+    """The read side of the loop: gaius fits, the gauge obeys — or ignores safely."""
+
+    def setUp(self):
+        gauge._TUNED = None
+
+    def tearDown(self):
+        gauge._TUNED = None
+        os.environ["CONTEXT_GAUGE_THRESHOLDS"] = NO_THRESHOLDS  # not pop — that
+        # would fall back to the operator's real fit and leak into other tests
+
+    def _write(self, base, blob):
+        p = os.path.join(base, "thresholds.json")
+        Path(p).write_text(json.dumps(blob), encoding="utf-8")
+        os.environ["CONTEXT_GAUGE_THRESHOLDS"] = p
+        gauge._TUNED = None
+        return p
+
+    def test_a_published_fit_moves_the_bands(self):
+        with tempfile.TemporaryDirectory() as base:
+            self._write(base, {"working": {"green_max": 60_000, "yellow_max": 120_000,
+                                           "orange_max": 200_000, "red_max": 320_000}})
+            # 150K is RED under the shipped 40/90/150/250; the fit says the rot
+            # starts later, so the same fuel now reads ORANGE.
+            self.assertEqual(gauge.band_for(150_000)[0], "ORANGE")
+            self.assertEqual(gauge.active_ceilings()[0][0], 60_000)
+
+    def test_defaults_stand_when_no_fit_is_published(self):
+        with tempfile.TemporaryDirectory() as base:
+            os.environ["CONTEXT_GAUGE_THRESHOLDS"] = os.path.join(base, "absent.json")
+            gauge._TUNED = None
+            self.assertEqual(gauge.active_ceilings()[0], gauge.ABSOLUTE_CEILINGS)
+            self.assertEqual(gauge.band_for(150_000)[0], "RED")
+
+    def test_a_corrupt_or_non_monotonic_fit_is_refused(self):
+        bad = [
+            "{not json",
+            json.dumps({"working": {"green_max": 90_000, "yellow_max": 40_000,
+                                    "orange_max": 150_000, "red_max": 250_000}}),  # not ascending
+            json.dumps({"working": {"green_max": -1, "yellow_max": 2,
+                                    "orange_max": 3, "red_max": 4}}),              # non-positive
+            json.dumps({"working": {"green_max": 40_000}}),                        # incomplete
+            json.dumps(["not", "a", "dict"]),
+        ]
+        with tempfile.TemporaryDirectory() as base:
+            p = os.path.join(base, "thresholds.json")
+            os.environ["CONTEXT_GAUGE_THRESHOLDS"] = p
+            for blob in bad:
+                with self.subTest(blob=blob[:40]):
+                    Path(p).write_text(blob, encoding="utf-8")
+                    gauge._TUNED = None
+                    self.assertEqual(gauge.active_ceilings()[0], gauge.ABSOLUTE_CEILINGS,
+                                     "a broken fit must degrade to the shipped guess")
+                    self.assertEqual(gauge.band_for(150_000)[0], "RED")
+
+    def test_the_legend_reports_the_ceilings_actually_in_force(self):
+        with tempfile.TemporaryDirectory() as base:
+            self._write(base, {"working": {"green_max": 60_000, "yellow_max": 120_000,
+                                           "orange_max": 200_000, "red_max": 320_000}})
+            line = gauge.gauge_line(150_000, 210_000, 60_000, window=1_000_000)
+            self.assertIn("60K", line)
+            self.assertIn("(fitted)", line)
+            self.assertNotIn("🟢<40K", line, "legend showed defaults while a fit was live")
+
+
+class TestTesseraChildren(unittest.TestCase):
+    """Foreign-family strip: directory names only, never ndjson bodies."""
+
+    def _tree(self, live_ndjson=(), live_other=(), raw_json=()):
+        td = tempfile.mkdtemp(prefix="gauge-tessera-")
+        live = Path(td) / "live"
+        raw = Path(td) / "raw"
+        live.mkdir()
+        raw.mkdir()
+        for tid in live_ndjson:
+            (live / f"{tid}.ndjson").write_text("MUST-NOT-BE-READ\n", encoding="utf-8")
+        for name in live_other:
+            (live / name).write_text("x", encoding="utf-8")
+        for tid in raw_json:
+            (raw / f"{tid}.json").write_text("{}", encoding="utf-8")
+        return td
+
+    def tearDown(self):
+        os.environ.pop("CONTEXT_GAUGE_TESSERA_ROOT", None)
+        os.environ.pop("CONTEXT_GAUGE_CHILDREN", None)
+        os.environ.pop("CONTEXT_GAUGE_DISABLE", None)
+
+    def test_running_is_live_ndjson_minus_raw_json(self):
+        a = "T-20260818-010837-9ee4a0"
+        b = "T-20260818-010053-77dda0"
+        c = "T-20260817-202126-ae6636"
+        td = self._tree(live_ndjson=(a, b, c),
+                        live_other=(f"{a}.stderr", f"{b}.stderr"),
+                        raw_json=(b, c))
+        try:
+            ids = gauge.list_running_tesserae(Path(td))
+            self.assertEqual(ids, [a])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_missing_tessera_root_is_empty(self):
+        missing = Path(tempfile.mkdtemp()) / "no-such-tessera"
+        self.assertEqual(gauge.list_running_tesserae(missing), [])
+        self.assertEqual(gauge.children_lines(missing), [])
+
+    def test_missing_live_is_empty_even_if_raw_exists(self):
+        td = tempfile.mkdtemp()
+        try:
+            (Path(td) / "raw").mkdir()
+            (Path(td) / "raw" / "T-20260818-010837-9ee4a0.json").write_text("{}")
+            self.assertEqual(gauge.list_running_tesserae(Path(td)), [])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_missing_raw_treats_all_live_as_running(self):
+        td = tempfile.mkdtemp()
+        try:
+            live = Path(td) / "live"
+            live.mkdir()
+            tid = "T-20260818-010837-9ee4a0"
+            (live / f"{tid}.ndjson").write_text("x")
+            self.assertEqual(gauge.list_running_tesserae(Path(td)), [tid])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_unsafe_names_are_ignored(self):
+        td = tempfile.mkdtemp()
+        try:
+            live = Path(td) / "live"
+            raw = Path(td) / "raw"
+            live.mkdir()
+            raw.mkdir()
+            for bad in (
+                "T-20260818-010837-9EE4A0.ndjson",  # uppercase hex
+                "not-an-id.ndjson",
+                "T-20260818-010837-9ee4a0.stderr",
+                "T-20260818-010837-9ee4a0.json",
+            ):
+                (live / bad).write_text("x")
+            ok = "T-20260818-010837-9ee4a0"
+            (live / f"{ok}.ndjson").write_text("x")
+            self.assertEqual(gauge.list_running_tesserae(Path(td)), [ok])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_cap_and_overflow(self):
+        ids = [
+            "T-20260818-010800-aaaaa0",
+            "T-20260818-010801-aaaaa1",
+            "T-20260818-010802-aaaaa2",
+            "T-20260818-010803-aaaaa3",
+            "T-20260818-010804-aaaaa4",
+            "T-20260818-010805-aaaaa5",
+        ]
+        td = self._tree(live_ndjson=ids)
+        try:
+            running = gauge.list_running_tesserae(Path(td))
+            self.assertEqual(len(running), 6)
+            lines = gauge.children_lines(Path(td))
+            self.assertEqual(len(lines), 1)
+            self.assertIn("6 tesserae", lines[0])
+            self.assertIn("+2", lines[0])
+            # newest-first: 010805 .. 010802 shown; 010801/010800 in overflow
+            self.assertIn("aaaaa5", lines[0])
+            self.assertIn("aaaaa2", lines[0])
+            self.assertNotIn("aaaaa0", lines[0])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_kill_switch(self):
+        tid = "T-20260818-010837-9ee4a0"
+        td = self._tree(live_ndjson=(tid,))
+        os.environ["CONTEXT_GAUGE_CHILDREN"] = "0"
+        try:
+            self.assertEqual(gauge.list_running_tesserae(Path(td)), [])
+            self.assertEqual(gauge.children_lines(Path(td)), [])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_statusline_appends_one_extra_row(self):
+        tid = "T-20260818-010837-9ee4a0"
+        td = self._tree(live_ndjson=(tid,))
+        path = _write_transcript([_assistant_line(60_000), _assistant_line(163_000)])
+        try:
+            rc, out, _ = run(
+                {"transcript_path": path, "session_id": "abc123",
+                 "model": {"display_name": "Opus 4.8"}},
+                env_extra={"CONTEXT_GAUGE_TESSERA_ROOT": td},
+            )
+            self.assertEqual(rc, 0)
+            rows = out.splitlines()
+            self.assertGreaterEqual(len(rows), 2)
+            self.assertIn("ORANGE", rows[0])
+            self.assertIn("9ee4a0", rows[1])
+            self.assertIn("1 tessera", rows[1])
+            self.assertNotIn("MUST-NOT-BE-READ", out)
+        finally:
+            os.unlink(path)
+            import shutil
+            shutil.rmtree(td)
+
+    def test_statusline_no_strip_when_root_absent(self):
+        path = _write_transcript([_assistant_line(60_000), _assistant_line(163_000)])
+        try:
+            rc, out, _ = run(
+                {"transcript_path": path, "session_id": "abc123",
+                 "model": {"display_name": "Opus 4.8"}},
+                env_extra={"CONTEXT_GAUGE_TESSERA_ROOT": "/no/such/tessera-root"},
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(out.splitlines()), 1)
+            self.assertIn("ORANGE", out)
+            self.assertNotIn("tessera", out)
+        finally:
+            os.unlink(path)
+
+    def test_never_opens_ndjson(self):
+        """A live ndjson that is a FIFO must not hang — we never open it."""
+        td = tempfile.mkdtemp()
+        try:
+            live = Path(td) / "live"
+            raw = Path(td) / "raw"
+            live.mkdir()
+            raw.mkdir()
+            tid = "T-20260818-010837-9ee4a0"
+            os.mkfifo(str(live / f"{tid}.ndjson"))
+            t0 = __import__("time").monotonic()
+            ids = gauge.list_running_tesserae(Path(td))
+            elapsed = __import__("time").monotonic() - t0
+            self.assertEqual(ids, [tid])
+            self.assertLess(elapsed, 1.0)
+        finally:
+            import shutil
+            shutil.rmtree(td)
 
 
 if __name__ == "__main__":

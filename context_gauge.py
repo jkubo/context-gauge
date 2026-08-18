@@ -24,17 +24,38 @@ The floor is harness boilerplate (system prompt, tool schemas, always-injected
 md) — cached, position-privileged, not what the model reasons over. Banding raw
 fill cries wolf on turn 1.
 
-WHY ABSOLUTE TOKENS, NOT % OF WINDOW. Degradation onset is roughly
-window-independent (NoLiMa, Chroma "Context Rot", Lost-in-the-Middle). A bigger
-window adds overflow room, not a longer effective span. The band is absolute
-working-set tokens; the window only feeds a cosmetic compaction-proximity %.
+TWO BANDS, AND THE COLOUR IS THE WORSE OF THEM:
+
+  • ABSOLUTE working-set tokens — reasoning degradation. Onset is roughly
+    window-independent (NoLiMa, Chroma "Context Rot", Lost-in-the-Middle); a
+    bigger window adds overflow room, not a longer effective span. A 190K
+    working set is degraded on a 1M window too, where a pure ratio reads 19%
+    and says GREEN.
+  • RATIO of the LIVE window consumed by total fill — proximity to the wall,
+    i.e. lossy auto-compaction. The absolute band cannot see this on a small
+    window, where 150K working is already the whole session.
+
+Neither is honest on both a 200K and a 1M session, so the band is
+``max(absolute, ratio)`` and the line names which one won.
+
+THE DENOMINATOR IS READ, NOT ASSUMED. Claude Code reports
+``context_window.context_window_size`` on every statusLine render; it moves
+with the effective model and the 1M-context beta. Assuming 200K under-reports
+a 1M session by 5x and fires the compaction warning at 16% full. When no
+window is reported and none is cached, the ratio band is SKIPPED rather than
+computed from a guess — an invented denominator must never manufacture a band.
 
 CONFIG (optional env vars):
   CONTEXT_GAUGE_DISABLE          any truthy → no-op (kill switch)
   CLAUDE_CONTEXT_GAUGE_DISABLE   legacy alias for the same
-  CONTEXT_GAUGE_WINDOW           override window for Claude % (default 200000)
+  CONTEXT_GAUGE_WINDOW           pin the Claude window (else read from harness)
   CLAUDE_CONTEXT_GAUGE_WINDOW    legacy alias
   CONTEXT_GAUGE_FLOOR_DIR        Grok floor cache dir (default ~/.context-gauge/floors)
+  CONTEXT_GAUGE_CHILDREN         0/false/off → hide the tessera children strip
+  CONTEXT_GAUGE_TESSERA_ROOT     test-only override of ~/.gaius/tessera
+  CONTEXT_GAUGE_SAMPLES          sample log (default ~/.context-gauge/samples.jsonl)
+  CONTEXT_GAUGE_NO_SAMPLES       any truthy → collect nothing
+  CONTEXT_GAUGE_THRESHOLDS       fitted band ceilings (default ~/.context-gauge/thresholds.json)
   GROK_HOME                      override ~/.grok
 
 FAIL-OPEN, ALWAYS. Any error / missing data / disable → emit nothing (hook) or a
@@ -43,6 +64,7 @@ non-zero (exit 2 erases the user's prompt on Claude Code).
 
 CLI:
   context-gauge --self-test
+  context-gauge --calibrate [FILE.jsonl]         # both axes over collected samples
   context-gauge --transcript FILE.jsonl          # Claude
   context-gauge --session-dir DIR                # Grok
   context-gauge --signals FILE.json              # Grok
@@ -68,6 +90,18 @@ YELLOW_MAX = 90_000
 ORANGE_MAX = 150_000
 RED_MAX = 250_000
 
+# --- Band thresholds — RATIO of the LIVE window consumed by TOTAL fill --------
+# This band is about hitting the wall (auto-compaction), not reasoning quality —
+# the absolute band above owns that. Thresholds start loose deliberately: a
+# session opens AT its floor, and a ~60-77K floor is already ~38% of a 200K
+# window, so a tighter GREEN would paint turn 1 yellow. Compaction lands around
+# 95%, which is where BLACK begins.
+RATIO_GREEN_MAX = 0.50
+RATIO_YELLOW_MAX = 0.70
+RATIO_ORANGE_MAX = 0.85
+RATIO_RED_MAX = 0.95
+COMPACTION_WARN_RATIO = 0.80
+
 DEFAULT_CLAUDE_WINDOW = 200_000
 DEFAULT_GROK_WINDOW = 500_000
 MAX_SCAN_BYTES = 64 * 1024 * 1024
@@ -79,6 +113,10 @@ BANDS = [
     (RED_MAX,    "RED",    "\U0001F534", "handoff imminent — finish only what's in hand; take on no new reasoning load (reasoning materially degraded)"),
     (float("inf"), "BLACK", "⚫", "STOP — hand off to a fresh session NOW; the next fan-out risks tripping lossy auto-compaction (reasoning unreliable)"),
 ]
+
+ABSOLUTE_CEILINGS = tuple(b[0] for b in BANDS)
+RATIO_CEILINGS = (RATIO_GREEN_MAX, RATIO_YELLOW_MAX, RATIO_ORANGE_MAX,
+                  RATIO_RED_MAX, float("inf"))
 
 _ANSI = {"GREEN": "\033[32m", "YELLOW": "\033[33m",
          "ORANGE": "\033[38;5;208m", "RED": "\033[1;31m",
@@ -95,14 +133,67 @@ def _disabled() -> bool:
     )
 
 
-def _claude_window() -> int:
-    raw = os.environ.get("CONTEXT_GAUGE_WINDOW") or os.environ.get(
-        "CLAUDE_CONTEXT_GAUGE_WINDOW", DEFAULT_CLAUDE_WINDOW
-    )
+def _positive_int(value):
+    """int(value) if it is a usable token count, else None."""
     try:
-        return int(raw)
+        n = int(value)
     except (TypeError, ValueError):
-        return DEFAULT_CLAUDE_WINDOW
+        return None
+    return n if n > 0 else None
+
+
+def window_from_payload(data) -> "int | None":
+    """The window the harness itself reports, or None.
+
+    Claude Code hands the statusLine a ``context_window`` object every render:
+    ``{total_input_tokens, context_window_size, used_percentage, ...}``. That
+    size is authoritative and dynamic — it follows the effective model, the
+    1M-context beta, plan-mode model swaps and CLAUDE_CODE_MAX_CONTEXT_TOKENS.
+    Read it; never infer it from the model name or the effort level.
+    """
+    if not isinstance(data, dict):
+        return None
+    cw = data.get("context_window")
+    if isinstance(cw, dict):
+        for key in ("context_window_size", "contextWindowSize"):
+            n = _positive_int(cw.get(key))
+            if n:
+                return n
+    else:
+        n = _positive_int(cw)
+        if n:
+            return n
+    for key in ("context_window_size", "contextWindowSize"):
+        n = _positive_int(data.get(key))
+        if n:
+            return n
+    return None
+
+
+def resolve_claude_window(payload_window=None, session_id="") -> "tuple[int, bool]":
+    """Return (window, known).
+
+    Priority: explicit env pin > what the harness reported this call > what the
+    harness reported earlier this session (cache) > DEFAULT_CLAUDE_WINDOW.
+
+    ``known`` is False only for that last case. Callers must not band on an
+    unknown window: guessing 200K on a 1M session inflates the ratio 5x, and a
+    gauge that cries BLACK at 20% full gets ignored, which is the one failure
+    mode a fuel gauge cannot afford.
+    """
+    pinned = _positive_int(
+        os.environ.get("CONTEXT_GAUGE_WINDOW")
+        or os.environ.get("CLAUDE_CONTEXT_GAUGE_WINDOW")
+    )
+    if pinned:
+        return pinned, True
+    reported = _positive_int(payload_window)
+    if reported:
+        return reported, True
+    cached = load_window(session_id) if session_id else None
+    if cached:
+        return cached, True
+    return DEFAULT_CLAUDE_WINDOW, False
 
 
 # Session ids are attacker-adjacent: they name a cache file and a session dir.
@@ -151,16 +242,107 @@ def _grok_home() -> Path:
     return Path(_env_path("GROK_HOME", default="~/.grok"))
 
 
+def _samples_path() -> Path:
+    custom = _env_path("CONTEXT_GAUGE_SAMPLES", default="")
+    return Path(custom) if custom else _floor_dir().parent / "samples.jsonl"
+
+
 def _fmt_k(n) -> str:
     n = float(n)
     return f"{n/1000:.0f}K" if n < 1_000_000 else f"{n/1_000_000:.2f}M"
 
 
+def _fmt_window(n) -> str:
+    """Windows are round numbers — "1M" reads better than "1.00M"."""
+    s = _fmt_k(n)
+    return s[:-1].rstrip("0").rstrip(".") + "M" if s.endswith("M") else s
+
+
+def _band_index(value, ceilings) -> int:
+    for i, ceiling in enumerate(ceilings):
+        if value < ceiling:
+            return i
+    return len(ceilings) - 1
+
+
+# ── Fitted thresholds (the closed loop) ───────────────────────────────────────
+# `gaius degradation calibrate --apply` measures where degradation events
+# actually cluster and publishes ceilings here. This is the READ side. Memoized
+# per process — each render is a fresh process, so one small read, never a
+# re-stat storm. Absent/corrupt/incomplete file → compiled defaults, silently:
+# a broken tuning file must degrade to the shipped guess, not to no gauge.
+_TUNED = None
+_TUNE_KEYS = ("green_max", "yellow_max", "orange_max", "red_max")
+
+
+def _thresholds_path() -> Path:
+    custom = _env_path("CONTEXT_GAUGE_THRESHOLDS", default="")
+    return Path(custom) if custom else _floor_dir().parent / "thresholds.json"
+
+
+def _tuned() -> dict:
+    global _TUNED
+    if _TUNED is not None:
+        return _TUNED
+    _TUNED = {}
+    try:
+        blob = json.loads(_thresholds_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return _TUNED
+    if not isinstance(blob, dict):
+        return _TUNED
+    for axis in ("working", "ratio"):
+        spec = blob.get(axis)
+        if not isinstance(spec, dict):
+            continue
+        vals = [spec.get(k) for k in _TUNE_KEYS]
+        try:
+            vals = [float(v) for v in vals]
+        except (TypeError, ValueError):
+            continue
+        # Monotonic and positive, or it is not a band table.
+        if all(v > 0 for v in vals) and all(a < b for a, b in zip(vals, vals[1:])):
+            _TUNED[axis] = tuple(vals) + (float("inf"),)
+    return _TUNED
+
+
+def active_ceilings():
+    """(absolute, ratio) ceilings in force — fitted if published, else defaults."""
+    t = _tuned()
+    return (t.get("working", ABSOLUTE_CEILINGS), t.get("ratio", RATIO_CEILINGS))
+
+
 def band_for(working):
-    for ceiling, name, emoji, action in BANDS:
-        if working < ceiling:
-            return name, emoji, action
-    return BANDS[-1][1], BANDS[-1][2], BANDS[-1][3]
+    """Absolute working-set band. Kept as-is — external callers import this."""
+    _c, name, emoji, action = BANDS[_band_index(working, active_ceilings()[0])]
+    return name, emoji, action
+
+
+def resolve_band(working, total=None, window=None):
+    """Band = the WORSE of the working-set band and the window-ratio band.
+
+    Returns ``(name, emoji, action, source, frac)``. ``frac`` is the share of
+    the window consumed, or None when ``window`` is None (unknown) — in which
+    case the ratio band is skipped entirely and the absolute band stands alone,
+    which is the pre-dynamic-window behaviour.
+    """
+    abs_ceilings, ratio_ceilings = active_ceilings()
+    idx_abs = _band_index(working, abs_ceilings)
+    frac = None
+    idx_ratio = None
+    if window and total is not None and total > 0:
+        frac = total / float(window)
+        idx_ratio = _band_index(frac, ratio_ceilings)
+
+    if idx_ratio is None or idx_abs == idx_ratio:
+        idx, source = idx_abs, "working set" if idx_ratio is None else "both"
+    elif idx_ratio > idx_abs:
+        idx, source = idx_ratio, "window ratio"
+    else:
+        idx, source = idx_abs, "working set"
+
+    _c, name, emoji, action = BANDS[idx]
+    return name, emoji, action, source, frac
 
 
 # ── Claude: transcript usage ──────────────────────────────────────────────────
@@ -248,15 +430,21 @@ def scan_usage(transcript_path):
     return first, last
 
 
-def reading_claude(transcript_path):
-    """Return (working, total, floor, window, model) or None."""
+def reading_claude(transcript_path, window=None, session_id=""):
+    """Return (working, total, floor, window, model) or None.
+
+    ``window`` in is whatever this call's payload reported (or None); ``window``
+    out is the resolved size, or **None when it is only a guess** — that is the
+    signal downstream not to compute a ratio band from it.
+    """
     first, last = scan_usage(transcript_path)
     if last is None:
         return None
     total = compute_fill(last)
     floor = compute_fill(first) if first is not None else 0
     working = max(0, total - floor)
-    return working, total, floor, _claude_window(), ""
+    resolved, known = resolve_claude_window(window, session_id)
+    return working, total, floor, (resolved if known else None), ""
 
 
 # Back-compat: pre-rename consumers import this module and call reading().
@@ -312,19 +500,11 @@ def load_floor(session_id: str):
         return None
 
 
-def save_floor(session_id: str, floor: int, window: int, model: str, compaction_count: int):
-    path = _floor_path(session_id)
-    if path is None:
-        return
-    payload = json.dumps({
-        "floor": int(floor),
-        "window": int(window),
-        "model": model or "",
-        "compaction_count": int(compaction_count or 0),
-        "seeded_at": time.time(),
-    }, indent=2) + "\n"
+def _secure_write_json(path: Path, obj: dict):
+    """Write JSON to a cache file, privately, never through a symlink."""
+    payload = json.dumps(obj, indent=2) + "\n"
     try:
-        d = _floor_dir()
+        d = path.parent
         # 0o700 survives any umask (umask only clears bits), so a dir we create
         # is private by construction. An older 0755 dir is tightened in place.
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -350,6 +530,125 @@ def save_floor(session_id: str, floor: int, window: int, model: str, compaction_
         pass
 
 
+def save_floor(session_id: str, floor: int, window: int, model: str, compaction_count: int):
+    path = _floor_path(session_id)
+    if path is None:
+        return
+    _secure_write_json(path, {
+        "floor": int(floor),
+        "window": int(window),
+        "model": model or "",
+        "compaction_count": int(compaction_count or 0),
+        "seeded_at": time.time(),
+    })
+
+
+# ── Claude: remembered window ─────────────────────────────────────────────────
+# Only the statusLine payload is documented to carry context_window, but the
+# hook surfaces need the same denominator. The statusLine renders constantly,
+# so it seeds this cache and the hook reads it. Same dir, same allowlisted id,
+# same 0700/0600 write — a distinct suffix so it cannot collide with a floor.
+
+def _window_cache_path(session_id: str):
+    sid = safe_session_id(session_id)
+    if not sid:
+        return None
+    return _floor_dir() / f"{sid}.window.json"
+
+
+def load_window(session_id: str):
+    path = _window_cache_path(session_id)
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return _positive_int(payload.get("window")) if isinstance(payload, dict) else None
+
+
+SAMPLES_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _sample_state_path(session_id: str):
+    sid = safe_session_id(session_id)
+    return (_floor_dir() / f"{sid}.sample.json") if sid else None
+
+
+def record_sample(session_id, harness, working, total, floor, window,
+                  model="", effort=""):
+    """Append one RAW observation per turn, so thresholds can be MEASURED.
+
+    Numbers only — never a band. Persisting GREEN/ORANGE/... would freeze
+    today's guess into history and make recalibration circular; storing raw
+    fuel means changing a threshold re-buckets every sample ever taken. (Same
+    contract as gaius.degradation's turn_fuel, which is why this records the
+    one column that table structurally cannot: ``window``. A Claude transcript
+    carries ``usage`` but never the window, so only this surface — handed
+    ``context_window`` by the harness on every render — can witness it.)
+
+    BOTH axes land in one row: ``working`` for the reasoning axis, and
+    ``total``+``window`` for the saturation ratio. Deduped on ``total``,
+    because the statusLine re-renders many times per turn while the fill only
+    moves when the model actually spends context.
+
+    Content-free: token counts, a session id, model and effort. No prompt or
+    tool text ever reaches this file.
+    """
+    if os.environ.get("CONTEXT_GAUGE_NO_SAMPLES"):
+        return
+    sid = safe_session_id(session_id)
+    state = _sample_state_path(sid)
+    total = _positive_int(total)
+    if not sid or state is None or total is None:
+        return
+    try:
+        prev = json.loads(state.read_text(encoding="utf-8")).get("last_total")
+    except (OSError, ValueError, UnicodeDecodeError, AttributeError):
+        prev = None
+    if prev == total:
+        return
+    row = {
+        "ts": round(time.time(), 3),
+        "session": sid,
+        "harness": harness,
+        "working": int(working or 0),
+        "total": total,
+        "floor": int(floor or 0),
+        "window": _positive_int(window),
+        "model": safe_model(model),
+        "effort": safe_model(effort),
+    }
+    try:
+        path = _samples_path()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # One generation of rotation: a gauge must never fill a disk.
+        if path.exists() and path.stat().st_size > SAMPLES_MAX_BYTES:
+            path.replace(path.with_suffix(".1.jsonl"))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(path), flags, 0o600)
+        try:
+            os.write(fd, (json.dumps(row) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        return  # fail-open: a sampler must never break the gauge
+    _secure_write_json(state, {"last_total": total})
+
+
+def save_window(session_id: str, window):
+    """Remember a harness-reported window. No-op unless it changed.
+
+    This runs on every statusLine render — rewriting an identical file a few
+    times a second is pure churn.
+    """
+    window = _positive_int(window)
+    path = _window_cache_path(session_id)
+    if path is None or window is None or load_window(session_id) == window:
+        return
+    _secure_write_json(path, {"window": window, "seeded_at": time.time()})
+
+
 def resolve_floor(session_id: str, total: int, window: int, model: str, compaction_count: int) -> int:
     if total <= 0:
         return 0
@@ -372,13 +671,16 @@ def reading_grok_signals(sig: dict, session_id: str):
     total = int(sig.get("contextTokensUsed") or 0)
     if total <= 0:
         return None
-    window = int(sig.get("contextWindowTokens") or 0) or DEFAULT_GROK_WINDOW
+    # Grok reports its own window in signals.json. Only when it does not is the
+    # default a guess — and a guess must not reach the ratio band.
+    reported = _positive_int(sig.get("contextWindowTokens"))
+    window = reported or DEFAULT_GROK_WINDOW
     models = sig.get("modelsUsed") or []
     model = safe_model(sig.get("primaryModelId") or (models[0] if models else ""))
     cc = int(sig.get("compactionCount") or 0)
     floor = resolve_floor(session_id, total, window, model, cc)
     working = max(0, total - floor)
-    return working, total, floor, window, model
+    return working, total, floor, reported, model
 
 
 def reading_grok(session_id: str, workspace: str | None = None):
@@ -394,20 +696,122 @@ def reading_grok(session_id: str, workspace: str | None = None):
 # ── shared render ─────────────────────────────────────────────────────────────
 
 def gauge_line(working, total, floor, window=None, model=""):
-    name, emoji, action = band_for(working)
-    window = window or _claude_window()
-    pct = (total / window * 100.0) if window else 0.0
-    compaction = " · compaction near ⚠" if pct >= 80 else ""
-    model_bit = f" · model {model}" if model else ""
+    name, emoji, action, source, frac = resolve_band(working, total, window)
+    if frac is None:
+        # Say so out loud. A denominator presented without a caveat gets read as
+        # measured, and this one is a fallback constant.
+        shown, _known = resolve_claude_window(window)
+        window_bit = f"· window {_fmt_window(shown)}? (assumed — none reported) "
+        compaction = ""
+    else:
+        window_bit = f"· {frac*100:.0f}% of {_fmt_window(window)} window "
+        compaction = "· compaction near ⚠ " if frac >= COMPACTION_WARN_RATIO else ""
+    model_bit = f"· model {model} " if model else ""
+    # Print the ceilings ACTUALLY in force. A legend showing the shipped
+    # defaults while a fit is live would misreport the gauge to itself.
+    a, r = active_ceilings()
+    tuned_bit = " (fitted)" if _tuned() else ""
     return (
         f"⛽ CONTEXT FUEL {_fmt_k(working)} working set ({emoji} {name}) "
         f"[{_fmt_k(total)} total − {_fmt_k(floor)} floor] "
-        f"· {pct:.0f}% of {_fmt_k(window)} window{compaction}{model_bit} "
+        f"{window_bit}{compaction}{model_bit}"
+        f"· band set by: {source} "
         f"· reasoning: {action}. "
-        f"[bands: \U0001F7E2<{_fmt_k(GREEN_MAX)} \U0001F7E1<{_fmt_k(YELLOW_MAX)} "
-        f"\U0001F7E0<{_fmt_k(ORANGE_MAX)} \U0001F534<{_fmt_k(RED_MAX)} ⚫≥{_fmt_k(RED_MAX)}; "
-        f"mechanical/retrieval work gets ~2-3× headroom]"
+        f"[working set: \U0001F7E2<{_fmt_k(a[0])} \U0001F7E1<{_fmt_k(a[1])} "
+        f"\U0001F7E0<{_fmt_k(a[2])} \U0001F534<{_fmt_k(a[3])} ⚫≥{_fmt_k(a[3])} "
+        f"· window: \U0001F7E2<{r[0]:.0%} \U0001F7E1<{r[1]:.0%} "
+        f"\U0001F7E0<{r[2]:.0%} \U0001F534<{r[3]:.0%} ⚫≥{r[3]:.0%}{tuned_bit} "
+        f"· colour = the worse of the two; mechanical/retrieval work gets ~2-3× headroom]"
     )
+
+
+def load_samples(path=None):
+    """Every recorded observation. Corrupt lines are skipped, not fatal."""
+    p = Path(path) if path else _samples_path()
+    rows = []
+    try:
+        with open(p, "rb") as f:
+            for raw in f:
+                try:
+                    obj = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(obj, dict) and obj.get("total"):
+                    rows.append(obj)
+    except OSError:
+        return []
+    return rows
+
+
+def _pct(sorted_vals, p):
+    if not sorted_vals:
+        return 0
+    k = (len(sorted_vals) - 1) * p
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (k - lo)
+
+
+def calibrate(path=None):
+    """Both axes, side by side, so the thresholds can be argued from data.
+
+    This is DESCRIPTIVE only: where sessions actually sit. It tells you whether
+    a threshold is reachable and how much of your life it colours — not whether
+    crossing it hurts. That needs an outcome signal (gaius.degradation's tool
+    errors / thrash / reverts, joined on session+window), and it needs samples
+    to accumulate first. Reading a curve off three sessions is how you get a
+    confident wrong answer.
+    """
+    rows = load_samples(path)
+    out = [f"samples: {len(rows)}"]
+    if not rows:
+        out.append("(nothing collected yet — the gauge records one row per turn as you work)")
+        return "\n".join(out)
+
+    sessions = {r.get("session") for r in rows}
+    windows = {}
+    for r in rows:
+        windows[r.get("window")] = windows.get(r.get("window"), 0) + 1
+    out.append(f"sessions: {len(sessions)}")
+    out.append("windows seen: " + ", ".join(
+        f"{_fmt_window(w) if w else 'unreported'}×{n}"
+        for w, n in sorted(windows.items(), key=lambda kv: -kv[1])))
+
+    working = sorted(int(r.get("working") or 0) for r in rows)
+    ratios = sorted(r["total"] / r["window"] for r in rows if r.get("window"))
+
+    out.append("")
+    out.append("WORKING SET (reasoning axis)          p50      p75      p90      p95      p99      max")
+    out.append("  tokens                        " + "".join(
+        f"{_fmt_k(_pct(working, p)):>9}" for p in (.5, .75, .9, .95, .99, 1.0)))
+    if ratios:
+        out.append("WINDOW SATURATION (space axis)        p50      p75      p90      p95      p99      max")
+        out.append("  % of window                   " + "".join(
+            f"{_pct(ratios, p)*100:>8.0f}%" for p in (.5, .75, .9, .95, .99, 1.0)))
+    else:
+        out.append("WINDOW SATURATION: no sample carried a reported window yet.")
+
+    def _share(vals, ceilings):
+        counts = [0] * len(BANDS)
+        for v in vals:
+            counts[_band_index(v, ceilings)] += 1
+        return counts
+
+    abs_ceilings, ratio_ceilings = active_ceilings()
+    out.append("")
+    out.append("thresholds in force: " + ("FITTED from measured rot "
+               "(gaius degradation calibrate)" if _tuned() else "shipped defaults — "
+               "run `gaius degradation calibrate` to fit them from your own data"))
+    out.append("time spent per band under those thresholds (change them and re-run — no band is stored):")
+    names = [b[1] for b in BANDS]
+    wshare = _share(working, abs_ceilings)
+    out.append("  working set : " + "  ".join(
+        f"{n} {c*100//max(1, len(working))}%" for n, c in zip(names, wshare)))
+    if ratios:
+        rshare = _share(ratios, ratio_ceilings)
+        out.append("  saturation  : " + "  ".join(
+            f"{n} {c*100//max(1, len(ratios))}%" for n, c in zip(names, rshare)))
+    return "\n".join(out)
 
 
 def _safe_write(text: str, trailing_newline: bool = True) -> None:
@@ -462,27 +866,54 @@ def emit_hook(text: str, event: str = "UserPromptSubmit"):
     _safe_write(payload)
 
 
-def band_segment(working):
-    name, emoji, _action = band_for(working)
+def band_flag(name, source):
+    """The bar flag names the REMEDY — and the remedy differs by axis.
+
+    A bloated working set and a full window both end a session, but not the
+    same way: one reasons worse, the other gets auto-compacted out from under
+    you. Flagging both "handoff soon" was only ever right because on a 200K
+    window they arrived together (118K working + a 77K floor IS 97% of 200K).
+    An honest denominator pulled them apart, and the flag was left asserting
+    the space axis while the band's own advice said "checkpoint soon".
+    """
+    if name == "BLACK":
+        return "⚑ HANDOFF NOW"
+    by_window = source in ("window ratio", "both")
+    if name == "RED":
+        return "⚑ compaction imminent" if by_window else "⚑ handoff soon"
+    if name == "ORANGE":
+        return "⚑ compaction near" if by_window else "⚑ checkpoint"
+    return ""
+
+
+def band_segment(working, total=None, window=None):
+    name, emoji, _action, source, frac = resolve_band(working, total, window)
     color = _ANSI.get(name, "")
     seg = f"{color}⛽ {emoji} {name} {_fmt_k(working)}{_RESET}"
-    if name == "BLACK":
-        seg += f" {color}⚑ HANDOFF NOW{_RESET}"
-    elif name in ("ORANGE", "RED"):
-        seg += f" {color}⚑ handoff soon{_RESET}"
+    if frac is not None:
+        # The denominator earns its place on the bar: it is the number that
+        # silently changed under you when the model or the beta changed.
+        seg += f"{_SEP}{color}{frac*100:.0f}% of {_fmt_window(window)}{_RESET}"
+    flag = band_flag(name, source)
+    if flag:
+        seg += f" {color}{flag}{_RESET}"
     return seg
 
 
-def statusline_claude(transcript_path, model=""):
+def statusline_claude(transcript_path, model="", window=None, session_id="", effort=""):
     tail = model or ""
     if _disabled():
         return tail
     suffix = (_SEP + tail) if tail else ""
-    r = reading_claude(transcript_path) if transcript_path else None
+    r = reading_claude(transcript_path, window, session_id) if transcript_path else None
     if r is None:
         return f"{_DIM}⛽ …{_RESET}{suffix}"
-    working, _t, _f, _w, _m = r
-    return band_segment(working) + suffix
+    working, total, floor, win, _m = r
+    # Sample only from a live session. `--transcript` inspection of someone
+    # else's log must not enter the calibration corpus.
+    if session_id:
+        record_sample(session_id, "claude", working, total, floor, win, model, effort)
+    return band_segment(working, total, win) + suffix
 
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
@@ -531,15 +962,101 @@ def _looks_like_grok(data: dict) -> bool:
     return bool(os.environ.get("GROK_SESSION_ID"))
 
 
+# ── tessera children strip (statusLine extra rows) ────────────────────────────
+# Still-running ⇔ live/<id>.ndjson exists AND raw/<id>.json does not.
+# Discovery is two os.listdir calls. Never open, stat, or read an ndjson.
+
+_SAFE_TID = re.compile(r"\A[TV]-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\Z")
+CHILDREN_MAX = 4
+_TESSERA_ROOT_DEFAULT = Path.home() / ".gaius" / "tessera"
+
+
+def _tessera_root() -> Path:
+    # Test hook only. Do not honour TESSERA_DIR — that is the manager's knob
+    # and must not steer an unsandboxed statusLine renderer.
+    override = os.environ.get("CONTEXT_GAUGE_TESSERA_ROOT")
+    if override:
+        return Path(override)
+    return _TESSERA_ROOT_DEFAULT
+
+
+def _children_disabled() -> bool:
+    raw = os.environ.get("CONTEXT_GAUGE_CHILDREN", "1")
+    return str(raw).strip().lower() in {"0", "false", "no", "off"}
+
+
+def list_running_tesserae(root: Path | None = None) -> list[str]:
+    """Return allowlisted ids that are live-without-raw. Two listings, no reads."""
+    if _children_disabled():
+        return []
+    root = _tessera_root() if root is None else root
+    try:
+        live_names = os.listdir(root / "live")
+    except OSError:
+        return []
+    try:
+        raw_names = os.listdir(root / "raw")
+    except FileNotFoundError:
+        raw_names = []
+    except OSError:
+        return []
+
+    raw_ids = set()
+    for name in raw_names:
+        if name.endswith(".json"):
+            tid = name[:-5]
+            if _SAFE_TID.match(tid):
+                raw_ids.add(tid)
+
+    running = []
+    for name in live_names:
+        if not name.endswith(".ndjson"):
+            continue
+        tid = name[:-7]
+        if _SAFE_TID.match(tid) and tid not in raw_ids:
+            running.append(tid)
+    # Id embeds UTC YYYYMMDD-HHMMSS; reverse sort is newest-first without mtime.
+    running.sort(reverse=True)
+    return running
+
+
+def children_lines(root: Path | None = None) -> list[str]:
+    """Zero or one extra statusLine row. Empty when there is nothing to show."""
+    running = list_running_tesserae(root)
+    if not running:
+        return []
+    shown = running[:CHILDREN_MAX]
+    extra = len(running) - len(shown)
+    shorts = " ".join(tid[-6:] for tid in shown)
+    if extra:
+        shorts += f" +{extra}"
+    n = len(running)
+    noun = "tessera" if n == 1 else "tesserae"
+    return [f"{_DIM}⬡ {n} {noun}{_RESET}{_SEP}{shorts}"]
+
+
 def main() -> int:
     args = sys.argv[1:]
 
     if "--self-test" in args:
         floor = 60_000
-        for working in (10_000, 60_000, 120_000, 200_000, 300_000):
-            print(f"bar   : {band_segment(working)}")
-            print(f"inject: {gauge_line(working, working + floor, floor, window=500_000, model='grok-4.5')}")
-            print()
+        # Same working sets, two windows: the divergence IS the feature.
+        for window in (200_000, 1_000_000):
+            print(f"── window {_fmt_window(window)} " + "─" * 46)
+            for working in (10_000, 60_000, 120_000, 200_000, 300_000):
+                total = working + floor
+                print(f"bar   : {band_segment(working, total, window)}")
+                print(f"inject: {gauge_line(working, total, floor, window=window, model='opus-5')}")
+                print()
+        print("── window unreported: ratio skipped, absolute stands alone " + "─" * 6)
+        for working in (10_000, 200_000):
+            print(f"bar   : {band_segment(working, working + floor, None)}")
+        return 0
+
+    if "--calibrate" in args:
+        i = args.index("--calibrate") + 1
+        path = args[i] if i < len(args) and not args[i].startswith("-") else None
+        print(calibrate(path))
         return 0
 
     if "--transcript" in args:
@@ -601,12 +1118,21 @@ def main() -> int:
     is_hook = bool(event)
     is_grok = _looks_like_grok(data)
     tp = data.get("transcript_path") or data.get("transcriptPath") or ""
+    claude_sid = safe_session_id(data.get("session_id") or data.get("sessionId") or "")
+    payload_window = window_from_payload(data)
+    model_name = (data.get("model") or {}).get("display_name", "") if isinstance(data.get("model"), dict) else ""
+    effort = (data.get("effort") or {}).get("level", "") if isinstance(data.get("effort"), dict) else ""
+    # Seed the cache from whichever surface was handed a window, so the surface
+    # that was not still bands against the real one.
+    if claude_sid and payload_window:
+        save_window(claude_sid, payload_window)
 
     if is_hook or is_grok:
         try:
             if _disabled():
                 return 0
             r = None
+            sid = ""
             if is_grok or not tp:
                 sid = (
                     data.get("sessionId")
@@ -624,10 +1150,13 @@ def main() -> int:
                 )
                 if sid:
                     r = reading_grok(sid, workspace or None)
+            harness = "grok"
             if r is None and tp:
-                r = reading_claude(tp)
+                r = reading_claude(tp, payload_window, claude_sid)
+                harness, sid = "claude", claude_sid
             if r is None:
                 return 0
+            record_sample(sid, harness, r[0], r[1], r[2], r[3], r[4] or model_name, effort)
             emit_hook(gauge_line(*r), event)
         except Exception:
             pass
@@ -635,10 +1164,16 @@ def main() -> int:
 
     # Claude statusLine mode (stdin is statusLine payload, not a hook)
     try:
-        model = (data.get("model") or {}).get("display_name", "")
-        _safe_write(statusline_claude(tp, model))
+        _safe_write(statusline_claude(tp, model_name, payload_window, claude_sid, effort))
     except Exception:
         _safe_write("")
+    # ADDITIONAL stdout lines: each print is another status row (Claude Code docs).
+    # Isolated so a children failure can never blank the fuel bar above it.
+    try:
+        for line in children_lines():
+            _safe_write(line)
+    except Exception:
+        pass
     return 0
 
 
