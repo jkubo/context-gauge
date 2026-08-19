@@ -984,7 +984,14 @@ _SAFE_TID = re.compile(r"\A[TV]-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\Z")
 # n <= CHILDREN_MAX renders n rows; beyond that the tail collapses so the strip
 # is at most 1 header + CHILDREN_MAX rows regardless of fleet width.
 CHILDREN_MAX = 4
-_NAME_MAX = 22
+# 32 columns. Measured against the real ledger (239 distinct unit slugs):
+# median 19, p90 26, max 32 — so 32 shows 100% of them whole and the ellipsis
+# becomes what it should be, an exception rather than a quarter of all rows.
+# At 22 it fired on 25% of units. It is also the one named 32-column width in
+# Claude Code itself (Jsc, feeding truncatePathMiddle), so the strip is not
+# inventing a number. The name column auto-sizes to the widest *visible* name,
+# so raising this costs nothing on a fleet of short names.
+_NAME_MAX = 32
 _NO_NAME = "—"
 _TESSERA_ROOT_DEFAULT = Path.home() / ".gaius" / "tessera"
 
@@ -1004,25 +1011,28 @@ def safe_unit(unit) -> str:
 
 
 def _elide(name: str, width: int = _NAME_MAX) -> str:
-    """Trim a display name to width from the MIDDLE, keeping both ends.
+    """Trim a display name to width, end-cut with a flush U+2026.
 
-    Unit slugs are hierarchical prefixes — ``family-subfamily-instance`` — so
-    the token that distinguishes two siblings is at the end, which is exactly
-    what tail-elision throws away. Same reason path displays elide the middle.
+    Matches Claude Code's own convention, read out of the 2.1.235 bundle
+    rather than guessed: its ``truncateToWidth`` keeps the prefix and appends
+    ``\\u2026`` with no separating space, and its Ink wrap dispatcher defaults
+    every ``truncate*`` position to *end*. Middle-cut exists there only for
+    filesystem paths (``truncatePathMiddle``, which keys on ``/`` to preserve
+    a basename); ``wrap:"truncate-middle"`` appears zero times in the JSX.
+    A unit slug has no ``/``, so it takes the label path, not the path path.
 
-    This is not hypothetical. ``gauge-unit-injection-refute`` and
-    ``gauge-unit-injection-empirical`` were both issued in one session and
-    tail-elision rendered both as ``gauge-unit-injection-…`` — two rows that
-    looked like the same unit twice. Keeping both ends separates them.
+    Middle-cut was tried first, to stop siblings like
+    ``gauge-unit-injection-refute`` and ``gauge-unit-injection-empirical``
+    rendering identically. That collision was real, but it was a symptom of a
+    22-column budget, not of the cut position: at 32 both names fit whole and
+    nothing is elided at all. Fixing the width removed the reason to deviate.
 
-    The id short still sits beside the name, so a collision was never
-    *ambiguous*, only unreadable. That is reason enough at a 2 s refresh.
+    ``len`` is the display width here only because _SAFE_UNIT admits nothing
+    but ASCII ``[A-Za-z0-9._-]``. Claude Code measures with grapheme-aware
+    ``Bun.stringWidth`` because it must; the allowlist is what buys us the
+    shortcut. Widen that charset and this needs to become width-aware too.
     """
-    if len(name) <= width:
-        return name
-    keep = width - 1  # the "…" costs one column
-    head = (keep + 1) // 2
-    return name[:head] + "…" + name[len(name) - (keep - head):]
+    return name if len(name) <= width else name[: width - 1] + "…"
 
 
 def _age_short(tid: str, now: float | None = None) -> str:
@@ -1039,11 +1049,21 @@ def _age_short(tid: str, now: float | None = None) -> str:
     secs = int((time.time() if now is None else now) - stamp)
     if secs < 0:  # child stamped in the future — clamp, never render "-4m"
         secs = 0
+    if secs < 60:
+        # Minutes-only rendered every fresh child as "0m", so during the one
+        # moment you actually watch a fan-out — the seconds after spawning it
+        # — every row read the same and the column carried no information.
+        return f"{secs}s"
     if secs < 3600:
         return f"{secs // 60}m"
     if secs < 86400:
         return f"{secs // 3600}h"
-    return f"{secs // 86400}d"
+    # Clamped to two digits so the field can never exceed 3 columns. The row
+    # format is f"{age:>3}", and Python's :>3 is a *minimum* width — it pads
+    # but never truncates, so a 4-char "100d" would silently shift the build
+    # mark right on that row alone. A child this old is pathological either
+    # way; "99d" and "412d" carry the same operational meaning.
+    return f"{min(secs // 86400, 99)}d"
 
 
 def _tessera_root() -> Path:

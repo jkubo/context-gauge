@@ -1630,6 +1630,7 @@ class TestTesseraChildren(unittest.TestCase):
         tid = "T-20260818-010801-aaaaa1"
         long = "gauge-strip-contract-sweep-phase-two-xyz"  # 40 chars: legal
         self.assertEqual(gauge.safe_unit(long), long)
+        self.assertGreater(len(long), gauge._NAME_MAX)
         td = self._tree(live_ndjson=(tid,), issues=({"visa": tid, "unit": long},))
         try:
             row = gauge.children_lines(Path(td))[1]
@@ -1637,23 +1638,30 @@ class TestTesseraChildren(unittest.TestCase):
             cell = gauge._elide(long)
             self.assertEqual(len(cell), gauge._NAME_MAX)
             self.assertIn(cell, row)
-            # elided from the middle, so both ends of the slug survive
-            self.assertTrue(cell.startswith("gauge-strip"))
-            self.assertTrue(cell.endswith("two-xyz"))
-            self.assertIn("…", cell)
+            # End-cut with a flush U+2026, matching Claude Code's own
+            # truncateToWidth — prefix kept, ellipsis appended, no space.
+            self.assertEqual(cell, long[: gauge._NAME_MAX - 1] + "…")
+            self.assertTrue(cell.endswith("…"))
+            self.assertNotIn(" …", cell, "ellipsis must be flush, not spaced")
+            self.assertNotIn("...", row, "ASCII dots are not the convention")
             self.assertIn("aaaaa1", row)
         finally:
             import shutil
             shutil.rmtree(td)
 
     def test_siblings_sharing_a_prefix_stay_distinguishable(self):
-        """Found by an adversarial executor, on names from its own session.
+        """The width, not the cut position, is what keeps siblings apart.
 
         Unit slugs are hierarchical prefixes, so siblings differ only in their
-        last token. Tail-elision discarded exactly that token and rendered
-        `gauge-unit-injection-refute` and `gauge-unit-injection-empirical`
-        identically — two rows that read as one unit listed twice. Both were
-        real units issued in the same session, an hour apart.
+        last token — precisely what an end-cut discards. At _NAME_MAX = 22 that
+        rendered `gauge-unit-injection-refute` and
+        `gauge-unit-injection-empirical` as the same string; both were real
+        units issued in one session, an hour apart, and an adversarial
+        executor found it. The fix is the budget: at 32 neither elides.
+
+        So this test guards the width against being quietly tightened back.
+        It does not care how elision cuts — that follows Claude Code (end),
+        and is pinned separately by test_oversize_unit_is_elided.
         """
         a = "T-20260818-010801-aaaaa1"
         b = "T-20260818-010802-bbbbb2"
@@ -1665,20 +1673,37 @@ class TestTesseraChildren(unittest.TestCase):
         try:
             rows = gauge.children_lines(Path(td))[1:]
             self.assertEqual(len(rows), 2)
-            # strip the id/age columns; compare only the rendered name cells
             cells = [gauge._elide(gauge.safe_unit(n)) for n in names]
             self.assertNotEqual(cells[0], cells[1],
                                 "two distinct units render as the same name")
-            for cell, row in zip(cells, rows):
-                self.assertIn(cell, row)
-                self.assertLessEqual(len(cell), gauge._NAME_MAX)
-            # both ends survive: the family prefix and the distinguishing tail
-            self.assertTrue(all(c.startswith("gauge-unit") for c in cells))
-            self.assertTrue(cells[0].endswith("refute"))
-            self.assertTrue(cells[1].endswith("empirical"))
+            for name, cell, row in zip(names, cells, rows):
+                self.assertEqual(cell, name, "a real sibling slug was elided")
+                self.assertIn(name, row)
+                self.assertNotIn("…", row)
         finally:
             import shutil
             shutil.rmtree(td)
+
+    def test_name_width_covers_the_real_unit_corpus(self):
+        """_NAME_MAX is a measurement, not a guess — keep it one.
+
+        Sampled from the live tessera ledger: 239 distinct unit slugs, median
+        19, p90 26, max 32. At 22 the ellipsis fired on a quarter of all rows,
+        which reads as premature because it is. These are the longest real
+        slugs; every one must render whole.
+        """
+        longest = (
+            "leitner-box-schedule-evidence-v2",   # 32, the corpus maximum
+            "gauge-unit-injection-empirical",     # 30
+            "gauge-statusline-refresh-facts",     # 30
+            "tessera-concord-lane-claiming",      # 29
+            "gauge-strip-contract-sweep",         # 26
+        )
+        for name in longest:
+            self.assertEqual(gauge.safe_unit(name), name)
+            self.assertEqual(gauge._elide(name), name,
+                             f"{name} ({len(name)}) does not fit _NAME_MAX="
+                             f"{gauge._NAME_MAX}")
 
     def test_unit_over_the_safe_length_is_refused(self):
         """safe_unit caps at 64; past that it is refused, not elided.
@@ -1768,14 +1793,36 @@ class TestTesseraChildren(unittest.TestCase):
             import shutil
             shutil.rmtree(td)
 
+    def test_age_under_a_minute_shows_seconds(self):
+        """A fresh fan-out is exactly when the column has to say something.
+
+        Minutes-only rendered every child under 60s as "0m", so at the one
+        moment you watch a fan-out every row read identically. All four
+        renderings fit the 3-column age field.
+        """
+        stamp = calendar.timegm(time.strptime("20260818-010800", "%Y%m%d-%H%M%S"))
+        tid = "T-20260818-010800-aaaaa1"
+        self.assertEqual(gauge._age_short(tid, now=stamp + 45), "45s")
+        self.assertEqual(gauge._age_short(tid, now=stamp + 9), "9s")
+        self.assertEqual(gauge._age_short(tid, now=stamp), "0s")
+        # the minute boundary is exact, not off by one
+        self.assertEqual(gauge._age_short(tid, now=stamp + 59), "59s")
+        self.assertEqual(gauge._age_short(tid, now=stamp + 60), "1m")
+        for secs in (0, 9, 45, 59, 60, 3599, 3600, 86399, 86400, 86400 * 400):
+            self.assertLessEqual(len(gauge._age_short(tid, now=stamp + secs)), 3,
+                                 f"age at {secs}s overflows the 3-col field")
+
     def test_age_comes_from_the_visa_stamp(self):
         stamp = calendar.timegm(time.strptime("20260818-010800", "%Y%m%d-%H%M%S"))
         tid = "T-20260818-010800-aaaaa1"
         self.assertEqual(gauge._age_short(tid, now=stamp + 120), "2m")
         self.assertEqual(gauge._age_short(tid, now=stamp + 3 * 3600), "3h")
         self.assertEqual(gauge._age_short(tid, now=stamp + 5 * 86400), "5d")
+        # Days clamp at two digits so the 3-col field cannot be overrun
+        self.assertEqual(gauge._age_short(tid, now=stamp + 99 * 86400), "99d")
+        self.assertEqual(gauge._age_short(tid, now=stamp + 500 * 86400), "99d")
         # A child stamped in the future clamps rather than rendering "-4m"
-        self.assertEqual(gauge._age_short(tid, now=stamp - 240), "0m")
+        self.assertEqual(gauge._age_short(tid, now=stamp - 240), "0s")
         # An impossible date is not an age; the child is still listed
         self.assertEqual(gauge._age_short("T-20261399-010800-aaaaa1"), "")
 

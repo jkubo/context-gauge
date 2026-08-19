@@ -163,9 +163,13 @@ exists and `raw/<id>.json` does not. **No child transcript is ever opened** —
 the age comes from the id's own UTC stamp, so a FIFO in `live/` cannot hang the
 status bar. Names come from the ledger's `issue.unit` through a whole-string
 allowlist that refuses rather than strips, since a *partially* sanitized name
-would still claim to identify a unit that is not the one running. Long names are
-elided from the middle (`gauge-unit-…-empirical`), because unit slugs are
-hierarchical prefixes and the distinguishing token is the last one.
+would still claim to identify a unit that is not the one running.
+
+The name column is 32 columns and elides end-first with a flush `…`, matching
+Claude Code's own `truncateToWidth`. 32 is measured, not chosen: across 239
+real unit slugs the median is 19 and the max is 32, so the ellipsis is a rare
+exception rather than something a quarter of rows hit. The column auto-sizes to
+the widest *visible* name, so a fleet of short names still renders a tight strip.
 
 By default the strip shows only units issued by the current session
 (`issue.manager_session` vs `CLAUDE_CODE_SESSION_ID`); parallel sessions on one
