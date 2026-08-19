@@ -132,6 +132,46 @@ Grok has no `statusLine` yet — inject-only.
 | `CLAUDE_CONTEXT_GAUGE_WINDOW` | — | Legacy alias. |
 | `CONTEXT_GAUGE_FLOOR_DIR` | `~/.context-gauge/floors` | Grok floor cache directory. |
 | `GROK_HOME` | `~/.grok` | Grok sessions root. |
+| `CONTEXT_GAUGE_CHILDREN` | `1` | `0`/`false`/`off` → hide the tessera children strip. |
+| `CONTEXT_GAUGE_CHILDREN_ALL` | *(unset)* | Truthy → show every live tessera, not just this session's. |
+
+---
+
+## Tessera children strip
+
+If `~/.gaius/tessera` has running units, the Claude statusLine grows a second
+block under the fuel bar — a header with the fleet count and fence mix, then one
+row per unit:
+
+```
+⛽ 🟠 ORANGE 140K · 22% of 1M ⚑ checkpoint · Opus 5
+⬡ 9 tesserae · 8 read · 1 build
+ ├ referee-order-v2  f596f9  16m ⚡
+ ├ sop-tessera-yaml  afd365  22h
+ ├ contract-p13      bb94f4  30m
+ └ +6 more
+```
+
+Bounded at `1 + CHILDREN_MAX` (5) rows at any fleet width, so a wide fan-out
+cannot push the prompt off screen. When more units are running than fit, the
+rows go to the ones you could *not* have guessed: any `build` fence first (the
+only unit that can write), then the oldest (a straggler from an earlier round —
+a unit spawned 40s ago is fine by definition). `⚡` marks a build fence.
+
+Discovery is two `os.listdir` calls; a unit is running iff `live/<id>.ndjson`
+exists and `raw/<id>.json` does not. **No child transcript is ever opened** —
+the age comes from the id's own UTC stamp, so a FIFO in `live/` cannot hang the
+status bar. Names come from the ledger's `issue.unit` through a whole-string
+allowlist that refuses rather than strips, since a *partially* sanitized name
+would still claim to identify a unit that is not the one running. Long names are
+elided from the middle (`gauge-unit-…-empirical`), because unit slugs are
+hierarchical prefixes and the distinguishing token is the last one.
+
+By default the strip shows only units issued by the current session
+(`issue.manager_session` vs `CLAUDE_CODE_SESSION_ID`); parallel sessions on one
+box do not bleed into each other's bars. It fails open — an unreadable ledger
+lists the ids unnamed rather than blanking the strip, because an empty strip
+reads identically to "nothing is running".
 
 ---
 

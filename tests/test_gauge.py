@@ -7,12 +7,14 @@ Layers:
 
 Run:  python3 -m pytest tests/ -v      (or)      python3 tests/test_gauge.py
 """
+import calendar
 import importlib.util
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -1119,7 +1121,13 @@ class TestFittedThresholds(unittest.TestCase):
 
 
 class TestTesseraChildren(unittest.TestCase):
-    """Foreign-family strip: directory names only, never ndjson bodies."""
+    """Foreign-family strip: directory names + ledger rows, never ndjson bodies.
+
+    Two untrusted inputs, two different reductions. Ids come from live/ filenames
+    and are pinned by _SAFE_TID before anything is derived from them. Display
+    names come from the ledger's issue.unit and are pinned by _SAFE_UNIT. A child
+    transcript is never opened at all — see test_never_opens_ndjson.
+    """
 
     def _tree(self, live_ndjson=(), live_other=(), raw_json=(), issues=()):
         td = tempfile.mkdtemp(prefix="gauge-tessera-")
@@ -1231,16 +1239,145 @@ class TestTesseraChildren(unittest.TestCase):
             running = gauge.list_running_tesserae(Path(td))
             self.assertEqual(len(running), 6)
             lines = gauge.children_lines(Path(td))
-            self.assertEqual(len(lines), 1)
+            # header + (CHILDREN_MAX - 1) child rows + overflow row
+            self.assertEqual(len(lines), 1 + gauge.CHILDREN_MAX)
             self.assertIn("6 tesserae", lines[0])
-            self.assertIn("+2", lines[0])
-            # newest-first: 010805 .. 010802 shown; 010801/010800 in overflow
-            self.assertIn("aaaaa5", lines[0])
-            self.assertIn("aaaaa2", lines[0])
-            self.assertNotIn("aaaaa0", lines[0])
+            self.assertIn("+3 more", lines[-1])
+            body = "\n".join(lines)
+            # oldest-first (no build fences here): 010800..010802 get the rows,
+            # the three newest collapse into the tail. A child spawned seconds
+            # ago is not news; one that has outlived the round is.
+            for shown in ("aaaaa0", "aaaaa1", "aaaaa2"):
+                self.assertIn(shown, body)
+            for hidden in ("aaaaa3", "aaaaa4", "aaaaa5"):
+                self.assertNotIn(hidden, body)
         finally:
             import shutil
             shutil.rmtree(td)
+
+    def test_row_budget_holds_at_any_fleet_width(self):
+        """A wide fan must never push the prompt off screen."""
+        ids = [f"T-20260818-0108{i:02d}-aaa{i:03d}" for i in range(50)]
+        td = self._tree(live_ndjson=ids)
+        try:
+            lines = gauge.children_lines(Path(td))
+            self.assertEqual(len(lines), 1 + gauge.CHILDREN_MAX)
+            self.assertIn("50 tesserae", lines[0])
+            # 3 rows spent on children, so the tail owns the other 47
+            self.assertIn("+47 more", lines[-1])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_collapse_keeps_the_writer_and_the_stragglers(self):
+        """Which children survive the collapse is the whole point of it.
+
+        The rows you lose should be the ones you could have guessed. A build
+        fence is the one child that can change the repo, and an *old* child in
+        a fan spawned seconds apart is a straggler from an earlier round —
+        both are news. The four newest reads are not.
+        """
+        # Suffixes must be real hex — _SAFE_TID rejects anything else, so a
+        # mnemonic fixture id would be dropped before it ever reached the
+        # renderer (which is the id allowlist doing its job on my own data).
+        old = "T-20260818-010800-00d0ed"      # straggler, read
+        writer = "T-20260818-010806-bbbbbd"   # newest, but it can write
+        mid = "T-20260818-010801-01dd1e"
+        noise = [f"T-20260818-0108{i:02d}-ee00{i:02d}" for i in range(2, 6)]
+        ids = [old, mid, writer, *noise]
+        td = self._tree(
+            live_ndjson=ids,
+            issues=tuple(
+                {"visa": t, "unit": t[-6:],
+                 "fence": "build" if t == writer else "read"}
+                for t in ids
+            ),
+        )
+        try:
+            lines = gauge.children_lines(Path(td))
+            body = "\n".join(lines)
+            self.assertIn("7 tesserae", lines[0])
+            self.assertIn("6 read", lines[0])
+            self.assertIn("1 build", lines[0])
+            # the writer outranks every read regardless of age...
+            self.assertIn("bbbbbd", body)
+            self.assertEqual(body.count("⚡"), 1)
+            self.assertIn("⚡", lines[1], "the writer must be the top row")
+            # ...then the two oldest reads take the remaining rows
+            self.assertIn("00d0ed", body)
+            self.assertIn("01dd1e", body)
+            for hidden in ("ee0002", "ee0003", "ee0004", "ee0005"):
+                self.assertNotIn(hidden, body)
+            self.assertIn("+4 more", lines[-1])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_row_order_does_not_depend_on_fleet_size(self):
+        """Adding a child must not reshuffle the children already on screen.
+
+        Ranking only on the overflow branch is the easy bug here: below the cap
+        you render the raw newest-first list, above it you render the ranked
+        one, so the fourth child leaps to the top the instant a fifth spawns.
+        At a 2 s refresh that reads as the strip glitching, not as news.
+        """
+        base = [f"T-20260818-0108{i:02d}-cccc{i:02d}" for i in range(4)]
+        extra = "T-20260818-010810-cccc10"
+        issues = tuple({"visa": t, "unit": "u" + t[-2:], "fence": "read"}
+                       for t in base + [extra])
+        fits = self._tree(live_ndjson=base, issues=issues)
+        overflows = self._tree(live_ndjson=base + [extra], issues=issues)
+        try:
+            a = gauge.children_lines(Path(fits))
+            b = gauge.children_lines(Path(overflows))
+            self.assertEqual(len(a), 5)   # header + 4, no tail
+            self.assertEqual(len(b), 5)   # header + 3 + tail
+            # The three top children are the same rows in the same order; only
+            # the fourth is displaced, and only by the overflow marker.
+            self.assertEqual(a[1:4], b[1:4])
+            self.assertIn("+2 more", b[-1])
+            # and below the cap the order is still oldest-first, not raw
+            self.assertIn("cccc00", a[1])
+            self.assertIn("cccc03", a[4])
+        finally:
+            import shutil
+            shutil.rmtree(fits)
+            shutil.rmtree(overflows)
+
+    def test_fence_summary_does_not_break_the_header_dim(self):
+        """A separator carrying its own reset would un-dim the tail of it.
+
+        SGR does not nest: \\x1b[0m is absolute, so an inner reset inside the
+        summary ends the header's dim early and everything after the first
+        separator renders brighter. The header should hold exactly three
+        resets — after the noun, inside the one real separator, and at the end
+        — no matter how many fence kinds are tallied.
+        """
+        one = self._tree(
+            live_ndjson=("T-20260818-010800-aaaaa0",),
+            issues=({"visa": "T-20260818-010800-aaaaa0", "unit": "u",
+                     "fence": "read"},),
+        )
+        ids = ("T-20260818-010800-aaaaa0", "T-20260818-010801-aaaaa1",
+               "T-20260818-010802-aaaaa2")
+        fences = ("read", "build", "nonsense")   # read + build + unknown
+        many = self._tree(
+            live_ndjson=ids,
+            issues=tuple({"visa": t, "unit": "u", "fence": f}
+                         for t, f in zip(ids, fences)),
+        )
+        try:
+            for td, label in ((one, "uniform"), (many, "three-way tally")):
+                header = gauge.children_lines(Path(td))[0]
+                self.assertEqual(header.count(gauge._RESET), 3,
+                                 f"{label} header leaked an SGR reset")
+            self.assertIn("1 read", gauge.children_lines(Path(many))[0])
+            self.assertIn("1 build", gauge.children_lines(Path(many))[0])
+            self.assertIn("1 ?", gauge.children_lines(Path(many))[0])
+        finally:
+            import shutil
+            shutil.rmtree(one)
+            shutil.rmtree(many)
 
     def test_kill_switch(self):
         tid = "T-20260818-010837-9ee4a0"
@@ -1253,9 +1390,9 @@ class TestTesseraChildren(unittest.TestCase):
             import shutil
             shutil.rmtree(td)
 
-    def test_statusline_appends_one_extra_row(self):
+    def test_statusline_appends_header_then_child_rows(self):
         tid = "T-20260818-010837-9ee4a0"
-        td = self._tree(live_ndjson=(tid,))
+        td = self._tree(live_ndjson=(tid,), issues=({"visa": tid, "unit": "solo"},))
         path = _write_transcript([_assistant_line(60_000), _assistant_line(163_000)])
         try:
             rc, out, _ = run(
@@ -1265,10 +1402,13 @@ class TestTesseraChildren(unittest.TestCase):
             )
             self.assertEqual(rc, 0)
             rows = out.splitlines()
-            self.assertGreaterEqual(len(rows), 2)
+            # fuel row, then the strip header, then one row per child
+            self.assertEqual(len(rows), 3)
             self.assertIn("ORANGE", rows[0])
-            self.assertIn("9ee4a0", rows[1])
             self.assertIn("1 tessera", rows[1])
+            self.assertNotIn("9ee4a0", rows[1], "the header must not carry ids")
+            self.assertIn("solo", rows[2])
+            self.assertIn("9ee4a0", rows[2])
             self.assertNotIn("MUST-NOT-BE-READ", out)
         finally:
             os.unlink(path)
@@ -1291,7 +1431,15 @@ class TestTesseraChildren(unittest.TestCase):
             os.unlink(path)
 
     def test_never_opens_ndjson(self):
-        """A live ndjson that is a FIFO must not hang — we never open it."""
+        """A live ndjson that is a FIFO must not hang — we never open it.
+
+        Both entry points are pinned. Discovery was always name-only, but the
+        tree renderer prints an age per child, and the obvious way to get one
+        is ``stat``/read on the live file — which on a FIFO blocks the status
+        bar forever. The age comes from the visa's own stamp precisely so this
+        stays true; this test is what makes that a contract rather than a
+        current implementation detail.
+        """
         td = tempfile.mkdtemp()
         try:
             live = Path(td) / "live"
@@ -1302,8 +1450,10 @@ class TestTesseraChildren(unittest.TestCase):
             os.mkfifo(str(live / f"{tid}.ndjson"))
             t0 = __import__("time").monotonic()
             ids = gauge.list_running_tesserae(Path(td))
+            lines = gauge.children_lines(Path(td))
             elapsed = __import__("time").monotonic() - t0
             self.assertEqual(ids, [tid])
+            self.assertIn("9ee4a0", "\n".join(lines))
             self.assertLess(elapsed, 1.0)
         finally:
             import shutil
@@ -1318,8 +1468,8 @@ class TestTesseraChildren(unittest.TestCase):
         td = self._tree(
             live_ndjson=(mine, other, orphan, bare, poison),
             issues=(
-                {"visa": mine, "manager_session": "sess-mine"},
-                {"visa": other, "manager_session": "sess-other"},
+                {"visa": mine, "manager_session": "sess-mine", "unit": "mine-unit"},
+                {"visa": other, "manager_session": "sess-other", "unit": "other-unit"},
                 {"visa": bare, "unit": "no-session-field"},
                 {"visa": poison, "manager_session": "\x1b]0;pwned\x07"},
             ),
@@ -1333,15 +1483,18 @@ class TestTesseraChildren(unittest.TestCase):
             running = gauge.list_running_tesserae(Path(td))
             self.assertEqual(len(running), 5, "discovery stays unscoped")
             lines = gauge.children_lines(Path(td))
-            self.assertEqual(len(lines), 1)
+            # header + the one child that is ours; no overflow row
+            self.assertEqual(len(lines), 2)
             self.assertIn("1 tessera", lines[0])
-            self.assertIn("aaaaa1", lines[0])
-            self.assertNotIn("bbbbb2", lines[0])
-            self.assertNotIn("ccccc3", lines[0])
-            self.assertNotIn("ddddd4", lines[0])
-            self.assertNotIn("eeeeee", lines[0])
-            self.assertNotIn("pwned", lines[0])
-            self.assertNotIn("MUST-NOT-BE-READ", lines[0])
+            # Ids live on the child rows, so every exclusion below must be
+            # checked against the whole strip. Asserting them on lines[0]
+            # alone passes vacuously — the header has never carried an id.
+            body = "\n".join(lines)
+            self.assertIn("aaaaa1", body)
+            for dropped in ("bbbbb2", "ccccc3", "ddddd4", "eeeeee"):
+                self.assertNotIn(dropped, body)
+            self.assertNotIn("pwned", body)
+            self.assertNotIn("MUST-NOT-BE-READ", body)
         finally:
             import shutil
             shutil.rmtree(td)
@@ -1352,12 +1505,18 @@ class TestTesseraChildren(unittest.TestCase):
         os.environ["CONTEXT_GAUGE_CHILDREN_ALL"] = "1"
         try:
             lines = gauge.children_lines(Path(td))
-            self.assertEqual(len(lines), 1)
+            self.assertEqual(len(lines), 1 + gauge.CHILDREN_MAX)
             self.assertIn("5 tesserae", lines[0])
-            # newest-first, cap 4: eeeeee..bbbbb2 shown; aaaaa1 in +1 overflow
-            self.assertIn("eeeeee", lines[0])
-            self.assertIn("bbbbb2", lines[0])
-            self.assertIn("+1", lines[0])
+            body = "\n".join(lines)
+            # oldest-first: 010800..010802 get rows, the last row is overflow
+            for shown in ("aaaaa1", "bbbbb2", "ccccc3"):
+                self.assertIn(shown, body)
+            for hidden in ("ddddd4", "eeeeee"):
+                self.assertNotIn(hidden, body)
+            self.assertIn("+2 more", lines[-1])
+            # the disarmed filter still renders names through safe_unit
+            self.assertIn("mine-unit", body)
+            self.assertIn("other-unit", body)
         finally:
             import shutil
             shutil.rmtree(td)
@@ -1367,11 +1526,13 @@ class TestTesseraChildren(unittest.TestCase):
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
         try:
             lines = gauge.children_lines(Path(td))
-            self.assertEqual(len(lines), 1)
+            self.assertEqual(len(lines), 1 + gauge.CHILDREN_MAX)
             self.assertIn("5 tesserae", lines[0])
-            self.assertIn("eeeeee", lines[0])
-            self.assertIn("bbbbb2", lines[0])
-            self.assertIn("+1", lines[0])
+            body = "\n".join(lines)
+            self.assertIn("aaaaa1", body)
+            self.assertIn("ccccc3", body)
+            self.assertNotIn("eeeeee", body)
+            self.assertIn("+2 more", lines[-1])
         finally:
             import shutil
             shutil.rmtree(td)
@@ -1380,16 +1541,322 @@ class TestTesseraChildren(unittest.TestCase):
         td, mine, other, orphan, bare, poison = self._session_tree()
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-mine"
         try:
-            lines = gauge.children_lines(Path(td))
-            body = lines[0] if lines else ""
+            body = "\n".join(gauge.children_lines(Path(td)))
             # orphan: live file, no issue row
             self.assertNotIn("ccccc3", body)
             # bare: issue row, no manager_session key
             self.assertNotIn("ddddd4", body)
+            self.assertNotIn("no-session-field", body)
             # poison: issue row, manager_session fails safe_session_id
             self.assertNotIn("eeeeee", body)
             self.assertNotIn("pwned", body)
             self.assertIn("aaaaa1", body)
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    # ── display names ────────────────────────────────────────────────────
+    # The whole point of the strip is that a fan-out reads as work, not as a
+    # row of hex. Everything below guards the one field that carries that:
+    # ``issue.unit``, which is the only executor-adjacent free text on this
+    # surface and therefore the only thing here that can attack a terminal.
+
+    def test_unit_names_are_rendered_and_column_aligned(self):
+        a = "T-20260818-010801-aaaaa1"
+        b = "T-20260818-010802-bbbbb2"
+        td = self._tree(
+            live_ndjson=(a, b),
+            issues=({"visa": a, "unit": "short"},
+                    {"visa": b, "unit": "a-much-longer-name"}),
+        )
+        try:
+            lines = gauge.children_lines(Path(td))
+            self.assertEqual(len(lines), 3)
+            body = "\n".join(lines)
+            self.assertIn("short", body)
+            self.assertIn("a-much-longer-name", body)
+            # The name column is padded to the widest visible name so the ids
+            # and ages line up; a ragged strip is unreadable at a glance.
+            short_row = [ln for ln in lines if "short" in ln][0]
+            self.assertIn("short" + " " * len("a-much-longer-name"[5:]), short_row)
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_hostile_unit_is_refused_not_stripped(self):
+        """A name that could repaint the terminal is dropped whole.
+
+        Refuse-not-strip is the deliberate choice: ``corpus\\x1b[2K`` reduced
+        to ``corpus`` would still be printed as if it named the running unit,
+        so a sanitizer that salvages the remainder produces a *lie* about
+        which tessera is on screen. safe_unit mirrors safe_session_id here,
+        not safe_model.
+        """
+        hostile = {
+            "T-20260818-010801-aaaaa1": "\x1b[2K\x1b[1Gowned",   # erase + home
+            "T-20260818-010802-bbbbb2": "name\rOVERWRITE",        # carriage return
+            "T-20260818-010803-ccccc3": "two\nlines",             # extra status row
+            "T-20260818-010804-ddddd4": "nul\x00byte",
+            "T-20260818-010805-eeeee5": "\x1b]0;title\x07",       # OSC title set
+        }
+        for tid, unit in hostile.items():
+            td = self._tree(live_ndjson=(tid,),
+                            issues=({"visa": tid, "unit": unit},))
+            try:
+                lines = gauge.children_lines(Path(td))
+                body = "\n".join(lines)
+                self.assertEqual(len(lines), 2, f"{unit!r} changed the row count")
+                self.assertIn(gauge._NO_NAME, body, f"{unit!r} was not refused")
+                self.assertIn(tid[-6:], body, "the id must survive a bad name")
+                for fragment in ("owned", "OVERWRITE", "lines", "byte", "title"):
+                    self.assertNotIn(fragment, body,
+                                     f"{unit!r} leaked past safe_unit")
+                self.assertNotIn("\x1b", body.replace(gauge._DIM, "")
+                                               .replace(gauge._RESET, ""))
+                self.assertNotIn("\r", body)
+                self.assertNotIn("\x00", body)
+            finally:
+                import shutil
+                shutil.rmtree(td)
+
+    def test_oversize_unit_is_elided(self):
+        """A legal-but-long slug is trimmed for the column, not refused.
+
+        This is the common case, not an edge one: real unit slugs
+        (``gauge-strip-contract-sweep``) already run past _NAME_MAX, so the
+        elision path is on the everyday render. It sits *after* safe_unit —
+        the allowlist decides legality, _elide only decides width.
+        """
+        tid = "T-20260818-010801-aaaaa1"
+        long = "gauge-strip-contract-sweep-phase-two-xyz"  # 40 chars: legal
+        self.assertEqual(gauge.safe_unit(long), long)
+        td = self._tree(live_ndjson=(tid,), issues=({"visa": tid, "unit": long},))
+        try:
+            row = gauge.children_lines(Path(td))[1]
+            self.assertNotIn(long, row)
+            cell = gauge._elide(long)
+            self.assertEqual(len(cell), gauge._NAME_MAX)
+            self.assertIn(cell, row)
+            # elided from the middle, so both ends of the slug survive
+            self.assertTrue(cell.startswith("gauge-strip"))
+            self.assertTrue(cell.endswith("two-xyz"))
+            self.assertIn("…", cell)
+            self.assertIn("aaaaa1", row)
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_siblings_sharing_a_prefix_stay_distinguishable(self):
+        """Found by an adversarial executor, on names from its own session.
+
+        Unit slugs are hierarchical prefixes, so siblings differ only in their
+        last token. Tail-elision discarded exactly that token and rendered
+        `gauge-unit-injection-refute` and `gauge-unit-injection-empirical`
+        identically — two rows that read as one unit listed twice. Both were
+        real units issued in the same session, an hour apart.
+        """
+        a = "T-20260818-010801-aaaaa1"
+        b = "T-20260818-010802-bbbbb2"
+        names = ("gauge-unit-injection-refute", "gauge-unit-injection-empirical")
+        td = self._tree(
+            live_ndjson=(a, b),
+            issues=({"visa": a, "unit": names[0]}, {"visa": b, "unit": names[1]}),
+        )
+        try:
+            rows = gauge.children_lines(Path(td))[1:]
+            self.assertEqual(len(rows), 2)
+            # strip the id/age columns; compare only the rendered name cells
+            cells = [gauge._elide(gauge.safe_unit(n)) for n in names]
+            self.assertNotEqual(cells[0], cells[1],
+                                "two distinct units render as the same name")
+            for cell, row in zip(cells, rows):
+                self.assertIn(cell, row)
+                self.assertLessEqual(len(cell), gauge._NAME_MAX)
+            # both ends survive: the family prefix and the distinguishing tail
+            self.assertTrue(all(c.startswith("gauge-unit") for c in cells))
+            self.assertTrue(cells[0].endswith("refute"))
+            self.assertTrue(cells[1].endswith("empirical"))
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_unit_over_the_safe_length_is_refused(self):
+        """safe_unit caps at 64; past that it is refused, not elided.
+
+        Elision is cosmetic and happens after the allowlist. A 300-char name
+        is not a display problem, it is a ledger nobody wrote by hand.
+        """
+        tid = "T-20260818-010801-aaaaa1"
+        td = self._tree(live_ndjson=(tid,),
+                        issues=({"visa": tid, "unit": "y" * 300},))
+        try:
+            row = gauge.children_lines(Path(td))[1]
+            self.assertIn(gauge._NO_NAME, row)
+            self.assertNotIn("yyy", row)
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_missing_issue_row_renders_placeholder(self):
+        """An unnamed child is still listed — the count must stay honest."""
+        tid = "T-20260818-010801-aaaaa1"
+        td = self._tree(live_ndjson=(tid,), issues=({"visa": "T-20260818-000000-999999",
+                                                     "unit": "someone-else"},))
+        try:
+            lines = gauge.children_lines(Path(td))
+            self.assertEqual(len(lines), 2)
+            self.assertIn("1 tessera", lines[0])
+            self.assertIn(gauge._NO_NAME, lines[1])
+            self.assertIn("aaaaa1", lines[1])
+            self.assertNotIn("someone-else", "\n".join(lines))
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_build_fence_is_marked_on_the_row_and_in_the_header(self):
+        tid = "T-20260818-010801-aaaaa1"
+        td = self._tree(live_ndjson=(tid,),
+                        issues=({"visa": tid, "unit": "writer", "fence": "build"},))
+        try:
+            lines = gauge.children_lines(Path(td))
+            self.assertIn("build", lines[0])
+            self.assertIn("⚡", lines[1])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_uniform_fence_collapses_to_one_word(self):
+        ids = ("T-20260818-010801-aaaaa1", "T-20260818-010802-bbbbb2")
+        td = self._tree(live_ndjson=ids,
+                        issues=tuple({"visa": t, "unit": "u", "fence": "read"}
+                                     for t in ids))
+        try:
+            header = gauge.children_lines(Path(td))[0]
+            self.assertIn("2 tesserae", header)
+            self.assertIn("read", header)
+            self.assertNotIn("2 read", header, "uniform fleets should not tally")
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_mixed_fences_are_tallied(self):
+        ids = ("T-20260818-010801-aaaaa1", "T-20260818-010802-bbbbb2",
+               "T-20260818-010803-ccccc3")
+        fences = {ids[0]: "read", ids[1]: "read", ids[2]: "build"}
+        td = self._tree(live_ndjson=ids,
+                        issues=tuple({"visa": t, "unit": "u", "fence": fences[t]}
+                                     for t in ids))
+        try:
+            header = gauge.children_lines(Path(td))[0]
+            self.assertIn("2 read", header)
+            self.assertIn("1 build", header)
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_unknown_fence_value_is_not_rendered(self):
+        """A fence outside the closed set counts as unknown, never echoes."""
+        tid = "T-20260818-010801-aaaaa1"
+        td = self._tree(live_ndjson=(tid,),
+                        issues=({"visa": tid, "unit": "u", "fence": "\x1b[31mgod"},))
+        try:
+            header = gauge.children_lines(Path(td))[0]
+            self.assertIn("?", header)
+            self.assertNotIn("god", header)
+            self.assertNotIn("\x1b[31m", header)
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_age_comes_from_the_visa_stamp(self):
+        stamp = calendar.timegm(time.strptime("20260818-010800", "%Y%m%d-%H%M%S"))
+        tid = "T-20260818-010800-aaaaa1"
+        self.assertEqual(gauge._age_short(tid, now=stamp + 120), "2m")
+        self.assertEqual(gauge._age_short(tid, now=stamp + 3 * 3600), "3h")
+        self.assertEqual(gauge._age_short(tid, now=stamp + 5 * 86400), "5d")
+        # A child stamped in the future clamps rather than rendering "-4m"
+        self.assertEqual(gauge._age_short(tid, now=stamp - 240), "0m")
+        # An impossible date is not an age; the child is still listed
+        self.assertEqual(gauge._age_short("T-20261399-010800-aaaaa1"), "")
+
+    def test_unreadable_ledger_still_lists_ids_unnamed(self):
+        """Fail-open: a broken ledger must not blank the strip.
+
+        The strip is a liveness display. If the ledger cannot be read, the
+        honest render is "these are running, I cannot say what they are" —
+        not silence, which reads identically to "nothing is running".
+        """
+        tid = "T-20260818-010801-aaaaa1"
+        td = self._tree(live_ndjson=(tid,))
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-mine"
+        try:
+            (Path(td) / "ledger.jsonl").mkdir()  # openable, not a regular file
+            lines = gauge.children_lines(Path(td))
+            self.assertEqual(len(lines), 2)
+            self.assertIn("1 tessera", lines[0])
+            self.assertIn("aaaaa1", lines[1])
+            self.assertIn(gauge._NO_NAME, lines[1])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_ledger_junk_lines_do_not_break_naming(self):
+        a = "T-20260818-010801-aaaaa1"
+        b = "T-20260818-010802-bbbbb2"
+        td = self._tree(live_ndjson=(a, b))
+        try:
+            (Path(td) / "ledger.jsonl").write_text(
+                "\n".join([
+                    "not json at all",
+                    "",
+                    '{"kind": "spawn", "visa": "%s", "unit": "wrong-kind"}' % a,
+                    '["issue", "a list, not a dict"]',
+                    '{"kind": "issue", "visa": "not-a-visa", "unit": "bad-visa"}',
+                    '{"kind": "issue", "visa": "%s", "unit": "first"}' % a,
+                    '{"kind": "issue", "visa": "%s", "unit": "second"}' % a,
+                    '{"kind": "issue", "visa": "%s", "unit": "beta"}' % b,
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            body = "\n".join(gauge.children_lines(Path(td)))
+            self.assertIn("second", body, "last issue row per visa wins")
+            self.assertNotIn("first", body)
+            self.assertNotIn("wrong-kind", body)
+            self.assertNotIn("bad-visa", body)
+            self.assertIn("beta", body)
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_nested_issue_token_does_not_bypass_the_kind_check(self):
+        """The substring prefilter is an optimisation, never the gate.
+
+        _issue_index skips json.loads on any line without the token ``"issue"``,
+        which is a ~33% saving on a real ledger. That makes the token reachable
+        as *data*: a return row can carry it inside its payload and sail past
+        the prefilter. The parsed ``kind`` check behind it is what actually
+        decides, and this test is the reason the fast path is safe to keep. If
+        someone ever "simplifies" the prefilter into the decision, this reds.
+        """
+        tid = "T-20260818-010801-aaaaa1"
+        td = self._tree(live_ndjson=(tid,))
+        try:
+            (Path(td) / "ledger.jsonl").write_text(
+                json.dumps({
+                    "kind": "return",
+                    "visa": tid,
+                    "unit": "impostor",
+                    # the prefilter token, nested where it is only ever data
+                    "parsed": {"schema": "issue", "note": '{"kind": "issue"}'},
+                }) + "\n",
+                encoding="utf-8",
+            )
+            lines = gauge.children_lines(Path(td))
+            body = "\n".join(lines)
+            self.assertNotIn("impostor", body)
+            # still listed, just unattributed — the count stays honest
+            self.assertIn("1 tessera", lines[0])
+            self.assertIn(gauge._NO_NAME, lines[1])
         finally:
             import shutil
             shutil.rmtree(td)
