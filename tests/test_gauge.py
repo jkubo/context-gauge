@@ -1127,6 +1127,11 @@ class TestTesseraChildren(unittest.TestCase):
     and are pinned by _SAFE_TID before anything is derived from them. Display
     names come from the ledger's issue.unit and are pinned by _SAFE_UNIT. A child
     transcript is never opened at all — see test_never_opens_ndjson.
+
+    Ledger terminal rows (revoke / return / verify / complete) subtract from
+    the live-without-raw candidate set in children_lines, not in
+    list_running_tesserae — so an unreadable ledger fail-opens rather than
+    blanking the bar.
     """
 
     def _tree(self, live_ndjson=(), live_other=(), raw_json=(), issues=()):
@@ -1164,6 +1169,12 @@ class TestTesseraChildren(unittest.TestCase):
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
 
     def test_running_is_live_ndjson_minus_raw_json(self):
+        """Discovery stays live-without-raw; the strip subtracts terminal rows.
+
+        list_running_tesserae is still the two-listdir residue predicate so
+        fail-open stays honest. children_lines is the display predicate, and
+        with no ledger (hence no terminal set) the two still agree.
+        """
         a = "T-20260818-010837-9ee4a0"
         b = "T-20260818-010053-77dda0"
         c = "T-20260817-202126-ae6636"
@@ -1173,6 +1184,12 @@ class TestTesseraChildren(unittest.TestCase):
         try:
             ids = gauge.list_running_tesserae(Path(td))
             self.assertEqual(ids, [a])
+            lines = gauge.children_lines(Path(td))
+            body = "\n".join(lines)
+            self.assertIn("1 tessera", lines[0])
+            self.assertIn("9ee4a0", body)
+            self.assertNotIn("77dda0", body)
+            self.assertNotIn("ae6636", body)
         finally:
             import shutil
             shutil.rmtree(td)
@@ -1878,32 +1895,92 @@ class TestTesseraChildren(unittest.TestCase):
     def test_nested_issue_token_does_not_bypass_the_kind_check(self):
         """The substring prefilter is an optimisation, never the gate.
 
-        _issue_index skips json.loads on any line without the token ``"issue"``,
-        which is a ~33% saving on a real ledger. That makes the token reachable
-        as *data*: a return row can carry it inside its payload and sail past
-        the prefilter. The parsed ``kind`` check behind it is what actually
-        decides, and this test is the reason the fast path is safe to keep. If
-        someone ever "simplifies" the prefilter into the decision, this reds.
+        _issue_index skips json.loads on any line without an issue/terminal
+        token, which is a ~33% saving on a real ledger. That makes the tokens
+        reachable as *data*: a return row can carry ``"issue"`` inside its
+        payload and sail past the prefilter. The parsed ``kind`` check behind
+        it is what actually decides, and this test is the reason the fast path
+        is safe to keep. If someone ever "simplifies" the prefilter into the
+        decision, this reds.
+
+        Corrected invariant: ``kind: "return"`` is a terminal row, so the
+        residue is subtracted rather than shown unnamed. The kind check still
+        refuses to treat the nested token as an issue attribution — ``impostor``
+        must not appear even as a name on a sibling that is still live.
         """
-        tid = "T-20260818-010801-aaaaa1"
-        td = self._tree(live_ndjson=(tid,))
+        dead = "T-20260818-010801-aaaaa1"
+        alive = "T-20260818-010802-bbbbb2"
+        td = self._tree(live_ndjson=(dead, alive))
         try:
             (Path(td) / "ledger.jsonl").write_text(
-                json.dumps({
-                    "kind": "return",
-                    "visa": tid,
-                    "unit": "impostor",
-                    # the prefilter token, nested where it is only ever data
-                    "parsed": {"schema": "issue", "note": '{"kind": "issue"}'},
-                }) + "\n",
+                "\n".join([
+                    json.dumps({
+                        "kind": "return",
+                        "visa": dead,
+                        "unit": "impostor",
+                        # the prefilter token, nested where it is only ever data
+                        "parsed": {"schema": "issue", "note": '{"kind": "issue"}'},
+                    }),
+                    json.dumps({
+                        "kind": "spawn",
+                        "visa": alive,
+                        "unit": "impostor",
+                        "parsed": {"schema": "issue", "note": '{"kind": "issue"}'},
+                    }),
+                ]) + "\n",
                 encoding="utf-8",
             )
             lines = gauge.children_lines(Path(td))
             body = "\n".join(lines)
             self.assertNotIn("impostor", body)
-            # still listed, just unattributed — the count stays honest
+            # return is terminal: dead residue is gone. spawn is not: alive
+            # stays listed, unnamed — the nested token did not become an issue.
+            self.assertEqual(len(lines), 2)
             self.assertIn("1 tessera", lines[0])
+            self.assertIn("bbbbb2", body)
+            self.assertNotIn("aaaaa1", body)
             self.assertIn(gauge._NO_NAME, lines[1])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_revoked_residue_renders_zero_tessera_rows(self):
+        """Canary: live-without-raw plus an issue+revoke pair renders nothing.
+
+        Must fail before terminal-row subtraction, pass after. Discovery
+        still reports the residue so fail-open is not a blanket blank-out.
+        """
+        tid = "T-20260818-010837-9ee4a0"
+        td = self._tree(live_ndjson=(tid,))
+        try:
+            (Path(td) / "ledger.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"kind": "issue", "v": 1, "visa": tid, "unit": "ghost"}),
+                    json.dumps({"kind": "revoke", "v": 1, "visa": tid}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(gauge.list_running_tesserae(Path(td)), [tid])
+            self.assertEqual(gauge.children_lines(Path(td)), [])
+        finally:
+            import shutil
+            shutil.rmtree(td)
+
+    def test_issue_without_terminal_row_still_renders(self):
+        """Near-miss: issue-only residue must still render.
+
+        Must pass both before and after the fix, so subtraction cannot be a
+        blanket blank-out of every live visa.
+        """
+        tid = "T-20260818-010837-9ee4a0"
+        td = self._tree(live_ndjson=(tid,), issues=({"visa": tid, "unit": "alive"},))
+        try:
+            self.assertEqual(gauge.list_running_tesserae(Path(td)), [tid])
+            lines = gauge.children_lines(Path(td))
+            self.assertEqual(len(lines), 2)
+            self.assertIn("1 tessera", lines[0])
+            self.assertIn("alive", lines[1])
+            self.assertIn("9ee4a0", lines[1])
         finally:
             import shutil
             shutil.rmtree(td)

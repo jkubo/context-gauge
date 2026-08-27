@@ -1002,6 +1002,10 @@ _TESSERA_ROOT_DEFAULT = Path.home() / ".gaius" / "tessera"
 # reduced to "corpus" claims to be a unit that is not the one running.
 _SAFE_UNIT = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _FENCES = ("read", "build")
+_TERMINAL_KINDS = frozenset({"revoke", "return", "verify", "complete"})
+# Quoted so compact `"kind":"revoke"` still matches. Prefilter only — parsed
+# `kind` is the gate (test_nested_issue_token_does_not_bypass_the_kind_check).
+_LEDGER_KEEP_TOKENS = ('"issue"', '"revoke"', '"return"', '"verify"', '"complete"')
 
 
 def safe_unit(unit) -> str:
@@ -1085,19 +1089,22 @@ def _children_all() -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _issue_index(root: Path) -> dict[str, dict] | None:
-    """visa → {session, unit, fence} for each ledger issue row.
+def _issue_index(root: Path) -> tuple[dict[str, dict] | None, set[str]]:
+    """visa → {session, unit, fence} for each ledger issue row, plus terminal visas.
 
-    Last issue row per visa wins. None means the ledger could not be opened
-    as a regular file (caller fail-opens: shows every running id, unnamed).
-    A missing ledger is an empty map: nothing is attributed.
-    ``manager_session`` is executor-adjacent once it is copied into this
-    process; it is reduced with safe_session_id and never rendered. ``unit``
-    is rendered, so it is reduced with safe_unit and dropped on any mismatch.
+    Last issue row per visa wins. Index None means the ledger could not be
+    opened as a regular file (caller fail-opens: shows every running id,
+    unnamed, and treats the terminal set as empty). A missing ledger is an
+    empty map and an empty terminal set: nothing is attributed, nothing is
+    subtracted. ``manager_session`` is executor-adjacent once it is copied
+    into this process; it is reduced with safe_session_id and never rendered.
+    ``unit`` is rendered, so it is reduced with safe_unit and dropped on any
+    mismatch.
 
-    One pass serves both the session filter and the display names — the scan
-    is now unconditional (a name is needed even when the filter is disarmed),
-    so lines that cannot be an issue row skip json.loads entirely.
+    One pass serves the session filter, the display names, and the terminal
+    set — the scan is now unconditional (a name is needed even when the
+    filter is disarmed), so lines that cannot be an issue or terminal row
+    skip json.loads entirely.
 
     Cost, measured 2026-08-19 against a 2.28 MB / 772-row fixture (the real
     ledger was 2.31 MB / 808 rows at the time), Python 3.14, 80 interleaved
@@ -1123,28 +1130,30 @@ def _issue_index(root: Path) -> dict[str, dict] | None:
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
-        return {}
+        return {}, set()
     except OSError:
-        return None
+        return None, set()
     owned = True
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
+            return None, set()
         out: dict[str, dict] = {}
+        terminal: set[str] = set()
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
             owned = False
             for line in fh:
-                # Cheap reject before the expensive parse: an issue row must
-                # contain this token somewhere, so a line without it cannot be
-                # one. Deliberately looser than '"kind": "issue"' — that would
-                # miss the compact separator-free form.
+                # Cheap reject before the expensive parse: an issue or
+                # terminal row must contain one of these tokens somewhere, so
+                # a line without any cannot be one. Deliberately looser than
+                # '"kind": "issue"' — that would miss the compact
+                # separator-free form.
                 #
-                # This is an optimisation and NOT the gate. The token is
-                # reachable as data (a return row can carry it in its payload),
-                # so everything that survives here still faces the parsed
-                # `kind` check below. Pinned by
+                # This is an optimisation and NOT the gate. The tokens are
+                # reachable as data (a return row can carry "issue" in its
+                # payload), so everything that survives here still faces the
+                # parsed `kind` check below. Pinned by
                 # test_nested_issue_token_does_not_bypass_the_kind_check.
-                if '"issue"' not in line:
+                if not any(tok in line for tok in _LEDGER_KEEP_TOKENS):
                     continue
                 line = line.strip()
                 if not line:
@@ -1153,10 +1162,15 @@ def _issue_index(root: Path) -> dict[str, dict] | None:
                     obj = json.loads(line)
                 except ValueError:
                     continue
-                if not isinstance(obj, dict) or obj.get("kind") != "issue":
+                if not isinstance(obj, dict):
                     continue
                 visa = obj.get("visa")
                 if not isinstance(visa, str) or not _SAFE_TID.match(visa):
+                    continue
+                kind = obj.get("kind")
+                if kind in _TERMINAL_KINDS:
+                    terminal.add(visa)
+                if kind != "issue":
                     continue
                 fence = obj.get("fence")
                 out[visa] = {
@@ -1164,9 +1178,9 @@ def _issue_index(root: Path) -> dict[str, dict] | None:
                     "unit": safe_unit(obj.get("unit")),
                     "fence": fence if fence in _FENCES else "",
                 }
-        return out
+        return out, terminal
     except OSError:
-        return None
+        return None, set()
     finally:
         if owned:
             try:
@@ -1291,14 +1305,21 @@ def children_lines(root: Path | None = None) -> list[str]:
     At most ``1 + CHILDREN_MAX`` rows whatever the fleet width, so a wide fan
     can never push the prompt off screen. Empty list when nothing is running:
     the strip costs zero rows when idle.
+
+    Filesystem residue (live-without-raw) is the candidate set; ledger
+    terminal rows subtract from it here, not in list_running_tesserae. An
+    unreadable ledger fail-opens: the terminal set is empty and residue
+    renders unnamed rather than blanking the bar.
     """
     root = _tessera_root() if root is None else root
     running = list_running_tesserae(root)
     if not running:
         return []
-    # One ledger pass feeds both the session filter and the display names.
-    index = _issue_index(root)
+    # One ledger pass feeds the session filter, the display names, and the
+    # terminal set. Residue is the candidate list; terminal rows subtract.
+    index, terminal = _issue_index(root)
     running = _filter_running_to_session(running, index)
+    running = [t for t in running if t not in terminal]
     if not running:
         return []
     meta = index or {}
