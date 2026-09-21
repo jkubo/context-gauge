@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "context-gauge"
 version = "0.2.1"
-description = "Context-saturation gauge for Claude Code and Grok Build — band your reasoning working set (GREEN→BLACK) so you hand off before quality degrades."
+description = "Context-saturation gauge for Claude Code and Grok Build—reports your reasoning working set as an absolute band (GREEN→BLACK). Advisory telemetry for the operator, not a stop rule."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.9"

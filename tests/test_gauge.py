@@ -2050,5 +2050,55 @@ class TestBandLabelsCarryNoImperative(unittest.TestCase):
                 )
 
 
+class TestDocsDoNotReintroduceTheImperative(unittest.TestCase):
+    """The docs are the surface that would put the instructions back.
+
+    The band imperatives survived five rounds of correction partly because the
+    README kept documenting them as the product's feature ("so you split, scope
+    down, or hand off"). A reader who notices the docs disagreeing with the code
+    fixes the code. So the published surfaces are pinned too.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _read(self, name):
+        with open(os.path.join(self.ROOT, name), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_readme_band_table_matches_the_code(self):
+        readme = self._read("README.md")
+        for _ceiling, name, _emoji, label in gauge.BANDS:
+            self.assertIn(
+                label, readme,
+                f"README does not document the {name} band as the code defines it. "
+                "Update the table rather than the labels.",
+            )
+
+    def test_published_descriptions_carry_no_imperative(self):
+        """README prose and the PyPI description reach people who have never
+        read the source; they are where "it tells the model to hand off" would
+        be reintroduced as a selling point."""
+        forbidden = (
+            "so you split",
+            "so you hand off",
+            "before quality degrades",
+            "before quality quietly degrades",
+            "tells the model",
+        )
+        for name in ("README.md", "pyproject.toml"):
+            low = self._read(name).lower()
+            for phrase in forbidden:
+                self.assertNotIn(
+                    phrase, low,
+                    f"{name} advertises the gauge as instructing the reader: {phrase!r}",
+                )
+
+    def test_readme_keeps_the_rule_that_explains_why(self):
+        """A bare descriptive table invites someone to 'improve' it. The
+        rationale is what makes the constraint survive a well-meaning edit."""
+        readme = self._read("README.md")
+        self.assertIn("do not instruct the agent", readme.lower())
+        self.assertIn("TestBandLabelsCarryNoImperative", readme)
+
 if __name__ == "__main__":
     unittest.main()
