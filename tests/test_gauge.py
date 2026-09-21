@@ -1986,5 +1986,119 @@ class TestTesseraChildren(unittest.TestCase):
             shutil.rmtree(td)
 
 
+class TestBandLabelsCarryNoImperative(unittest.TestCase):
+    """The injected line must never instruct the agent reading it.
+
+    🔴 This is the test that did not exist. The band strings shipped as imperatives
+    ("STOP — hand off to a fresh session NOW", "finish only what's in hand", "prefer
+    delegating searches"), and because they land in an agent's context window on every
+    prompt, they competed with the user's actual request and won -- six separate
+    corrections from the operator (2026-08-19 through 2026-09-21) for narrating the band,
+    truncating work over it, or proposing a handoff on a colour change.
+
+    🔑 A 2026-08-28 cleanup deleted the same band tables out of the consuming skill files
+    and MISSED this generator, so the sentence came straight back. Documentation kept
+    losing to the live string; only a gate closes it. 115 tests passed over the imperative
+    the whole time, because none of them looked at what the label SAID.
+    """
+
+    # Verbs aimed at the reader. A label describes the measurement; it never directs.
+    FORBIDDEN = (
+        "stop", "hand off", "handoff", "wrap up", "finish only", "take on no",
+        "take no", "prefer ", "split before", "checkpoint", "you should", "must ",
+        "don't start", "do not start", "avoid ",
+    )
+
+    def test_no_band_label_contains_an_imperative(self):
+        for ceiling, name, emoji, label in gauge.BANDS:
+            low = label.lower()
+            for verb in self.FORBIDDEN:
+                self.assertNotIn(
+                    verb, low,
+                    f"band {name} label is an instruction, not a description: {label!r} "
+                    f"(contains {verb!r}). Band labels are injected into an agent's context "
+                    f"every turn; describe the number, never tell the reader what to do.",
+                )
+
+    def test_rendered_line_disclaims_itself(self):
+        """The line must say out loud that it is not a stop rule.
+
+        Removing the imperatives is necessary but not sufficient -- a bare band name still
+        reads as a verdict to a model looking for one. The disclaimer is what makes the
+        reading inert, so it is pinned here rather than left to a comment.
+        """
+        line = gauge.gauge_line(350_000, 453_000, 103_000)
+        low = line.lower()
+        self.assertIn("advisory", low)
+        self.assertIn("not a stop rule", low)
+        # and the specific sentence that caused 2026-09-21 must not be reachable
+        self.assertNotIn("hand off to a fresh session", low)
+        self.assertNotIn("stop —", low)
+
+    def test_every_band_renders_without_an_imperative(self):
+        """Walk one working-set value per band, not just the one that broke."""
+        for working in (20_000, 60_000, 120_000, 200_000, 350_000):
+            line = gauge.gauge_line(working, working + 103_000, 103_000)
+            # Split off the trailing disclaimer, which legitimately contains these words
+            # while negating them ("not a reason to hand off"). The MEASUREMENT half is
+            # what must stay clean.
+            measurement = line.split("— ADVISORY TELEMETRY")[0].lower()
+            for verb in ("stop", "hand off", "handoff", "wrap up", "checkpoint"):
+                self.assertNotIn(
+                    verb, measurement,
+                    f"working={working}: measurement half instructs the reader: {measurement!r}",
+                )
+
+
+class TestDocsDoNotReintroduceTheImperative(unittest.TestCase):
+    """The docs are the surface that would put the instructions back.
+
+    The band imperatives survived five rounds of correction partly because the
+    README kept documenting them as the product's feature ("so you split, scope
+    down, or hand off"). A reader who notices the docs disagreeing with the code
+    fixes the code. So the published surfaces are pinned too.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _read(self, name):
+        with open(os.path.join(self.ROOT, name), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_readme_band_table_matches_the_code(self):
+        readme = self._read("README.md")
+        for _ceiling, name, _emoji, label in gauge.BANDS:
+            self.assertIn(
+                label, readme,
+                f"README does not document the {name} band as the code defines it. "
+                "Update the table rather than the labels.",
+            )
+
+    def test_published_descriptions_carry_no_imperative(self):
+        """README prose and the PyPI description reach people who have never
+        read the source; they are where "it tells the model to hand off" would
+        be reintroduced as a selling point."""
+        forbidden = (
+            "so you split",
+            "so you hand off",
+            "before quality degrades",
+            "before quality quietly degrades",
+            "tells the model",
+        )
+        for name in ("README.md", "pyproject.toml"):
+            low = self._read(name).lower()
+            for phrase in forbidden:
+                self.assertNotIn(
+                    phrase, low,
+                    f"{name} advertises the gauge as instructing the reader: {phrase!r}",
+                )
+
+    def test_readme_keeps_the_rule_that_explains_why(self):
+        """A bare descriptive table invites someone to 'improve' it. The
+        rationale is what makes the constraint survive a well-meaning edit."""
+        readme = self._read("README.md")
+        self.assertIn("do not instruct the agent", readme.lower())
+        self.assertIn("TestBandLabelsCarryNoImperative", readme)
+
 if __name__ == "__main__":
     unittest.main()

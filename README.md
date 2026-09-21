@@ -1,16 +1,45 @@
 # ⛽ context-gauge
 
-A **context-saturation gauge for coding-agent harnesses** — [Claude Code](https://code.claude.com) and [Grok Build](https://docs.x.ai/build/cli). One small, dependency-free script that shows you — and tells the model — how full the session's *reasoning working set* is, so you split, scope down, or hand off **before** quality quietly degrades.
+A **context-saturation gauge for coding-agent harnesses**—[Claude Code](https://code.claude.com) and [Grok Build](https://docs.x.ai/build/cli). One small, dependency-free script that reports how full the session's *reasoning working set* is, as an absolute band.
 
 > Formerly `claude-context-gauge`. The binary is now `context-gauge`; `claude-context-gauge` remains a shim.
 
 ```
-🟢 GREEN   <40K   full reasoning capacity
-🟡 YELLOW  40–90K  prefer delegating searches; scope new inputs deliberately
-🟠 ORANGE  90–150K split before reading; no new large reasoning input; checkpoint soon
-🔴 RED     150–250K handoff imminent — finish what's in hand; take on no new load
-⚫ BLACK    ≥250K   STOP — hand off now; the next big step risks lossy auto-compaction
+🟢 GREEN   <40K    working set well inside the measured-reliable range
+🟡 YELLOW  40–90K  working set moderate
+🟠 ORANGE  90–150K working set large
+🔴 RED     150–250K working set at the ~200K native-reliability boundary
+⚫ BLACK    ≥250K   working set past the ~200K native-reliability boundary
 ```
+
+## 🔴 The labels describe the number. They do not instruct the agent.
+
+This is the one design rule the project has, and it was learned the hard way.
+
+The band strings used to be imperatives—`STOP — hand off to a fresh session NOW`,
+`finish only what's in hand`, `prefer delegating searches`, `checkpoint soon`—rendered into
+the model's context as `reasoning: <imperative>` on **every single prompt**. An agent reading
+that does not experience it as a gauge. It experiences it as an instruction sitting next to
+the user's actual request, and it acts on it: truncating verification, narrowing scope,
+proposing a handoff on an unfinished task, and reporting the colour back to an operator who
+was already looking at it on their status bar.
+
+One operator corrected that behaviour **six times** across five weeks. Five of those rounds
+were answered by writing the prohibition into the agent's own rule files. It kept happening,
+because a rule in a memory file cannot outrank a sentence that is regenerated into the context
+window on every turn. The sixth round deleted the imperative at the source instead, which
+worked immediately.
+
+So: **a band label states what the number is. Never what the reader should do about it.**
+`TestBandLabelsCarryNoImperative` fails the build on any verb aimed at the reader, and the
+injected line closes by disclaiming itself as advisory telemetry for the operator.
+
+If you are tempted to put the advice back because a descriptive label feels less useful—that
+is the point. The gauge's job is to report a measurement to a human who can see it. Deciding
+what to do about it is theirs.
+
+> The degradation thresholds below are a considered default, not a measured cliff for any
+> specific agent. Treat the boundary as a landmark, not a verdict.
 
 **Bands are absolute working-set tokens**, not a % of the model window. The same table applies to Claude (~200K–1M) and Grok (grok-4.5 ≈ 500K, composer-fast ≈ 200K). A bigger window adds overflow room, not a longer effective span.
 

@@ -2,8 +2,20 @@
 """context-gauge — a context-saturation gauge for coding-agent harnesses.
 
 One self-contained, dependency-free script (Python 3 stdlib only) that bands
-your **reasoning working set** (🟢→⚫) so you split / scope / hand off *before*
-quality quietly degrades.
+your **reasoning working set** (🟢→⚫) and reports it to the OPERATOR.
+
+🔴 THE READING IS TELEMETRY, NOT A NUDGE, AND NOT A STOP RULE. This docstring used to end
+"so you split / scope / hand off *before* quality quietly degrades", and the band strings
+were written to match. That is the bug. These lines land in an agent's context window on
+every prompt, where an imperative competes with the user's actual request — and wins often
+enough to have drawn six corrections from this tool's own operator (2026-08-19, 08-21,
+08-26, 08-27, 08-28, 09-21) for narrating the band, truncating work over it, or proposing a
+handoff because a colour changed.
+
+⚠️ The premise is also weaker than the old wording implied: measured on real transcripts,
+tool-error rate is FLAT from GREEN through RED; only the user-correction rate rises, and it
+rises most steeply at GREEN→YELLOW. The gauge is genuinely useful to a human deciding when to
+start a fresh session. It is not evidence that the agent should stop mid-task.
 
 Supported harnesses (auto-detected from stdin / env):
 
@@ -108,12 +120,29 @@ DEFAULT_CLAUDE_WINDOW = 200_000
 DEFAULT_GROK_WINDOW = 500_000
 MAX_SCAN_BYTES = 64 * 1024 * 1024
 
+# 🔴 DESCRIPTIVE LABELS ONLY — never imperatives aimed at the reading agent.
+#
+# These strings are injected into an agent's context window on every single prompt. A verb
+# here is not a hint, it is an instruction competing with the user's actual request, and it
+# wins often enough to have caused SIX corrections (2026-08-19, 08-21, 08-26, 08-27, 08-28,
+# 09-21): agents narrating the band back to the operator, shortening or skipping work because
+# of it, and proposing handoffs on a colour change mid-task.
+#
+# 🔑 Documentation did not fix it. A memory rule saying "the band is advisory" was loaded and
+# injected during three of those violations; it lost to the imperative sitting in the same
+# context window. The 08-28 round deleted the band tables out of the consuming skill files for
+# this reason and missed the generator — so the sentence came back from here. The imperative
+# does not get to exist.
+#
+# ⛔ Do not re-add "STOP", "hand off", "finish only", "prefer", "split", "checkpoint",
+# "take on no new", or any other verb directed at the reader. Describe the NUMBER. The operator
+# reads this gauge live and decides what it means.
 BANDS = [
-    (GREEN_MAX,  "GREEN",  "\U0001F7E2", "full reasoning capacity"),
-    (YELLOW_MAX, "YELLOW", "\U0001F7E1", "prefer delegating searches; scope new inputs deliberately"),
-    (ORANGE_MAX, "ORANGE", "\U0001F7E0", "split before reading; take on no new large reasoning input; checkpoint soon"),
-    (RED_MAX,    "RED",    "\U0001F534", "handoff imminent — finish only what's in hand; take on no new reasoning load (reasoning materially degraded)"),
-    (float("inf"), "BLACK", "⚫", "STOP — hand off to a fresh session NOW; the next fan-out risks tripping lossy auto-compaction (reasoning unreliable)"),
+    (GREEN_MAX,  "GREEN",  "\U0001F7E2", "working set well inside the measured-reliable range"),
+    (YELLOW_MAX, "YELLOW", "\U0001F7E1", "working set moderate"),
+    (ORANGE_MAX, "ORANGE", "\U0001F7E0", "working set large"),
+    (RED_MAX,    "RED",    "\U0001F534", "working set at the ~200K native-reliability boundary"),
+    (float("inf"), "BLACK", "⚫", "working set past the ~200K native-reliability boundary"),
 ]
 
 ABSOLUTE_CEILINGS = tuple(b[0] for b in BANDS)
@@ -718,12 +747,19 @@ def gauge_line(working, total, floor, window=None, model=""):
         f"[{_fmt_k(total)} total − {_fmt_k(floor)} floor] "
         f"{window_bit}{compaction}{model_bit}"
         f"· band set by: {source} "
-        f"· reasoning: {action}. "
+        f"· {action}. "
         f"[working set: \U0001F7E2<{_fmt_k(a[0])} \U0001F7E1<{_fmt_k(a[1])} "
         f"\U0001F7E0<{_fmt_k(a[2])} \U0001F534<{_fmt_k(a[3])} ⚫≥{_fmt_k(a[3])} "
         f"· window: \U0001F7E2<{r[0]:.0%} \U0001F7E1<{r[1]:.0%} "
         f"\U0001F7E0<{r[2]:.0%} \U0001F534<{r[3]:.0%} ⚫≥{r[3]:.0%}{tuned_bit} "
-        f"· colour = the worse of the two; mechanical/retrieval work gets ~2-3× headroom]"
+        f"· colour = the worse of the two] "
+        # 🔴 The old line closed with "reasoning: <imperative>" — it labelled the band as a
+        # verdict on the reader's own reasoning and then told them what to do about it. That
+        # framing caused six violations. State the reading, then disclaim it explicitly, so a
+        # model scanning its context finds nothing here to obey.
+        f"— ADVISORY TELEMETRY FOR THE OPERATOR, who watches this live. Not a stop rule, not a "
+        f"loop control, not a reason to hand off, wrap up, shorten, skip a step, or narrow "
+        f"scope. Do not mention it to the user."
     )
 
 
