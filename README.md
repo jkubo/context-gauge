@@ -185,8 +185,7 @@ interface. This repository is one. Installed, it draws the fuel band directly ab
   (`CONTEXT_GAUGE_NO_SAMPLES` still opts out). Without the CLI the mod samples nothing.
   A CLI from before `--record-sample` exits 0 and writes nothing, so a sample counts only
   when the CLI answers `ok`; otherwise the mod stops sampling for the session and says so
-  once, in a dim transcript line the model does not see. Upgrade or reinstall the CLI when
-  you install the mod.
+  once, in a dim transcript line the model does not see.
 - The **statusLine** and **UserPromptSubmit** wiring above stay supported; with the mod they
   are optional for Claude. **Grok is unchanged.**
 

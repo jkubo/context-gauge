@@ -11,6 +11,7 @@ import {
   fmtWindow,
   fuelSpans,
   pyFixed,
+  repliesIn,
   resolveBand,
   resolveFloor,
   staleFloorKeys,
@@ -92,9 +93,21 @@ describe('the floor', () => {
     expect(resolveFloor(61_000, 30_000, 9)).toBe(61_000)
   })
 
-  test('is never seeded past the first prompt: a late fill is not the floor', () => {
+  test('is never seeded past the first reply: a late fill is not the floor', () => {
     expect(resolveFloor(undefined, 240_000, 2)).toBeUndefined()
     expect(resolveFloor(undefined, 240_000, 40)).toBeUndefined()
+  })
+
+  test('a reply answers a prompt, not a tool result or a local command', () => {
+    const prompt = { role: 'user', toolResults: undefined } as const
+    const reply = { role: 'assistant' } as const
+    const result = { role: 'user', toolResults: [{}] } as const
+
+    expect(repliesIn([])).toBe(0)
+    expect(repliesIn([prompt])).toBe(0)
+    // /effort's two rows, then the prompt and a tool loop: one reply.
+    expect(repliesIn([prompt, prompt, prompt, reply, reply, result, reply])).toBe(1)
+    expect(repliesIn([prompt, reply, result, reply, prompt, prompt, prompt, reply])).toBe(2)
   })
 
   test('the store keeps the newest floors and drops the oldest', () => {

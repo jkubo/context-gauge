@@ -13,6 +13,7 @@ import {
   fittedCeilings,
   FLOOR_PREFIX,
   fuelSpans,
+  repliesIn,
   resolveFloor,
   staleFloorKeys,
   type Ceilings,
@@ -86,8 +87,12 @@ async function floorFor($: EngineInterface, held: Held, id: string, tokens: numb
     return stored ?? undefined
   }
 
-  // Asked once per session: the turn count only grows, so a refusal stands.
-  const floor = resolveFloor(stored, tokens, await $.session.turns())
+  // Asked once per session: replies only grow, so a refusal stands. A turn count
+  // of at most 1 settles it cheaply (replies never exceed turns); past that the
+  // replies are counted from the transcript (repliesIn says why).
+  const turns = await $.session.turns()
+  const replies = turns <= 1 ? turns : repliesIn(await $.session.messages())
+  const floor = resolveFloor(stored, tokens, replies)
 
   held.floors.set(id, floor ?? null)
 
@@ -178,7 +183,7 @@ async function recordSample($: EngineInterface, held: Held, value: GaugeReading)
 
   if (answer !== SAMPLE_ACK) {
     held.isSamplerOff = true
-    $.ui.log(`context-gauge: ${cli} did not acknowledge --record-sample; no calibration samples this session. Upgrade or reinstall the CLI to resume them.`)
+    $.ui.log(`context-gauge: ${cli} did not acknowledge --record-sample (a CLI from before that mode); no calibration samples this session.`)
   }
 }
 

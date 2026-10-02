@@ -273,17 +273,41 @@ export function ceilingsOf(fitted: Fitted): Ceilings {
  * the window grows back past the old floor. This is the one choice here that is
  * policy rather than parity; change it in both places or neither.
  *
- * A fill is the first response's only while the user has sent at most one
- * prompt (`turns`). A session the mod meets later (open when it was installed,
- * or resumed from before) gets no floor at all: one seeded deep into the session
- * would read its working set as zero, a false GREEN at any saturation.
+ * A fill is the first response's only while the model has answered the user at
+ * most once (`replies`, see repliesIn). A session the mod meets later (open
+ * when it was installed, or resumed from before) gets no floor at all: one
+ * seeded deep into the session would read its working set as zero, a false
+ * GREEN at any saturation.
  */
-export function resolveFloor(storedFloor: number | undefined, tokens: number | undefined, turns: number): number | undefined {
+export function resolveFloor(storedFloor: number | undefined, tokens: number | undefined, replies: number): number | undefined {
   if (storedFloor !== undefined && storedFloor > 0) {
     return storedFloor
   }
 
-  return tokens !== undefined && tokens > 0 && turns <= 1 ? tokens : undefined
+  return tokens !== undefined && tokens > 0 && replies <= 1 ? tokens : undefined
+}
+
+/** One row of `$.session.messages()`, as far as repliesIn reads it. */
+export type Row = { role: 'user' | 'assistant'; toolResults?: readonly unknown[] }
+
+/**
+ * How many times the model has answered the user: assistant rows straight after
+ * a user row that carries no tool result. Not the engine's turn count, which
+ * also counts a local command's rows (/effort, /model, `!` bash), so a session
+ * opened with one reads 3 turns at its first response.
+ */
+export function repliesIn(rows: readonly Row[]): number {
+  let replies = 0
+
+  for (let i = 1; i < rows.length; i++) {
+    const before = rows[i - 1]
+
+    if (rows[i]?.role === 'assistant' && before?.role === 'user' && !before.toolResults?.length) {
+      replies++
+    }
+  }
+
+  return replies
 }
 
 export const FLOOR_PREFIX = 'floor:'

@@ -1354,6 +1354,21 @@ class TestModParity(unittest.TestCase):
         found = re.findall(r"^const SAMPLE_ACK = '([^']*)'$", self._source("register.tsx"), re.M)
         self.assertEqual(found, [gauge.RECORD_SAMPLE_ACK], "the mod no longer checks the CLI's ack")
 
+    # The mod's Text colour props, as the SGR parameters _ANSI writes them.
+    FG = {"green": "32", "yellow": "33", "red": "31", "whiteBright": "97", "#ff8700": "38;5;208"}
+    BG = {"red": "41"}
+
+    def test_band_colours_match(self):
+        found = {}
+        for name, body in re.findall(r"^  ([A-Z]+): \{([^}]*)\},$", self._source("register.tsx"), re.M):
+            props = {k: v.strip("'") for k, v in re.findall(r"(\w+): ('[^']*'|true|false)", body)}
+            sgr = (["1"] if props.pop("bold", "false") == "true" else []) + [self.FG.get(props.pop("color", ""), "?")]
+            if "backgroundColor" in props:
+                sgr.append(self.BG.get(props.pop("backgroundColor"), "?"))
+            self.assertEqual(props, {}, f"{name} carries a prop _ANSI has no code for")
+            found[name] = f"\033[{';'.join(sgr)}m"
+        self.assertEqual(found, gauge._ANSI)
+
     def test_band_names_and_emoji_match(self):
         found = re.findall(r"\{ name: '([A-Z]+)', emoji: '([^']+)' \}", self._source("gauge.ts"))
         self.assertEqual(found, [(b[1], b[2]) for b in gauge.BANDS])

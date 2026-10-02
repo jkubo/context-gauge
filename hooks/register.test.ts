@@ -1,4 +1,4 @@
-import type { On, RenderPropsOf, SessionContextUsage } from 'claude-code'
+import type { On, RenderPropsOf, SessionContextUsage, SessionMessage } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 const PLUGIN = 'context-gauge'
@@ -23,6 +23,8 @@ type World = {
   store: Map<string, unknown>
   /** Prompts the user has sent: what `$.session.turns()` answers. */
   turns: number
+  /** The transcript: what `$.session.messages()` answers. */
+  messages: SessionMessage[]
   /** What the CLI prints to `--record-sample`. */
   answer: string
   runs: { argv: readonly string[]; stdin: string | undefined }[]
@@ -41,6 +43,7 @@ function worldOf(
     store = {},
     model = 'Opus 5',
     turns = 1,
+    messages = [],
     answer = 'ok\n',
   }: {
     env?: Record<string, string>
@@ -48,6 +51,7 @@ function worldOf(
     store?: Record<string, unknown>
     model?: string | null
     turns?: number
+    messages?: SessionMessage[]
     answer?: string
   } = {},
 ): World {
@@ -56,6 +60,7 @@ function worldOf(
     files: new Map(Object.entries(files)),
     store: new Map(Object.entries(store)),
     turns,
+    messages,
     answer,
     runs: [],
     writes: [],
@@ -73,6 +78,7 @@ function worldOf(
   on('session.usage', () => ({ value: { startedAt: 0, context: world.context, rateLimits: [] } }))
   on('session.id', () => ({ value: 'session-1' }))
   on('session.turns', () => (world.turnsAsked++, { value: world.turns }))
+  on('session.messages', () => ({ value: world.messages }))
   on('session.model', () => (model === null ? { deny: 'no model' } : { value: model }))
   on('fs.read', ($, e) => {
     const text = world.files.get(e.path)
@@ -95,6 +101,10 @@ function worldOf(
 }
 
 const ORANGE = { tokens: 200_000, window: 1_000_000 }
+
+const said = (role: SessionMessage['role'], text: string): SessionMessage => ({ role, text, toolUses: [] })
+// A local command's two rows, as the engine keeps them: user rows, counted as turns.
+const EFFORT = [said('user', '<command-name>/effort</command-name>'), said('user', '<local-command-stdout>Effort: high</local-command-stdout>')]
 
 describe('the band above the prompt', () => {
   test('draws the fuel row on top of what the chain beneath drew, on every surface it is raised on', async ($, on) => {
@@ -120,7 +130,16 @@ describe('the band above the prompt', () => {
     }
   })
 
-  test('every band is drawn in colours both surfaces accept', async ($, on) => {
+  // The statusLine's _ANSI, as Text props: 32, 33, 38;5;208, 1;31, 1;97;41.
+  const TONE = {
+    GREEN: { color: 'green' },
+    YELLOW: { color: 'yellow' },
+    ORANGE: { color: '#ff8700' },
+    RED: { color: 'red', bold: true },
+    BLACK: { color: 'whiteBright', backgroundColor: 'red', bold: true },
+  } as const
+
+  test('every band is drawn in its statusLine colour, which both surfaces accept', async ($, on) => {
     // A colour a surface refuses fails the whole tree, and the engine then draws its
     // own: nothing, here, so the other mods' rows in this band would vanish with ours.
     const world = worldOf(on, { tokens: 60_000, window: 1_000_000 })
@@ -135,8 +154,9 @@ describe('the band above the prompt', () => {
 
       for (const surface of SURFACES) {
         const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: BAND })
+        const band = await ui.find({ type: 'Text', text: new RegExp(`^⛽ \\S+ ${name} \\S+$`) })
 
-        expect(await ui.find({ type: 'Text', text: new RegExp(`^⛽ \\S+ ${name} `) }), `${surface} ${name}`).toBeDefined()
+        expect(band?.props, `${surface} ${name}`).toEqual(TONE[name])
         await ui.unmount()
       }
     }
@@ -310,9 +330,33 @@ describe('the floor', () => {
     expect(await ui.find({ type: 'Text', text: /RED 120K/ })).toBeDefined()
   })
 
+  test('is seeded at the first reply when a local command opened the session', async ($, on) => {
+    // /effort before the prompt: the engine counts 3 turns at the first response.
+    const world = worldOf(on, { window: 200_000 }, { turns: 3, messages: [...EFFORT, said('user', 'hi')] })
+    const clock = mock.clock(on)
+
+    await $.session.start(SESSION)
+    await clock.settle()
+    world.messages = [...world.messages, said('assistant', 'hello')]
+    world.context = { tokens: 61_000, window: 200_000 }
+    await clock.advance(1_500)
+    expect(world.store.get('floor:session-1')).toBe(61_000)
+
+    world.context = { tokens: 181_000, window: 200_000 }
+    await clock.advance(1_500)
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: BAND })
+
+      expect(await ui.find({ type: 'Text', text: /^⛽ 🔴 RED 120K$/ }), surface).toBeDefined()
+      await ui.unmount()
+    }
+  })
+
   test('is not seeded in a session met after its first prompt: no false GREEN', async ($, on) => {
     // Open when the mod arrived, or resumed from before it: 400K deep, floor unknown.
-    const world = worldOf(on, { tokens: 400_000, window: 1_000_000 }, { turns: 12, files: { [CLI]: '' } })
+    const messages = Array.from({ length: 12 }, (_, i) => [said('user', `prompt ${i}`), said('assistant', `reply ${i}`)]).flat()
+    const world = worldOf(on, { tokens: 400_000, window: 1_000_000 }, { turns: 12, messages, files: { [CLI]: '' } })
     const clock = mock.clock(on)
 
     await $.session.start(SESSION)
