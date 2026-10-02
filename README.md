@@ -170,9 +170,10 @@ interface. This repository is one. Installed, it draws the fuel band directly ab
   from the engine every 1.5 s and after each turn. Same bands, same thresholds, same flags as
   the statusLine: the band math is a port of `context_gauge.py`, and the Python suite fails
   if the two disagree on a constant or on any case in [`hooks/parity.ts`](hooks/parity.ts).
-- **The floor** is the fill of the first response the mod sees in a session (the session's
-  first, unless the mod arrived mid-session), kept for the session's life with compaction
-  included, as the statusLine's transcript scan has it.
+- **The floor** is the fill of the session's first response, kept for the session's life
+  with compaction included, as the statusLine's transcript scan has it. A session the mod
+  first meets after that (open when the mod was installed, or resumed from before it) has no
+  floor the mod can know, so its band stays the dim `⛽ …` rather than read it as GREEN.
 - **Nothing reaches the model.** The band is drawn for the operator only; the mod adds no
   prompt context and hooks no tool call.
 - **Fitted thresholds** are read from `CONTEXT_GAUGE_THRESHOLDS`, else
@@ -182,6 +183,10 @@ interface. This repository is one. Installed, it draws the fuel band directly ab
   `~/.local/bin/context-gauge`: the mod hands each measurement to
   `context-gauge --record-sample`, which writes the row the live paths write
   (`CONTEXT_GAUGE_NO_SAMPLES` still opts out). Without the CLI the mod samples nothing.
+  A CLI from before `--record-sample` exits 0 and writes nothing, so a sample counts only
+  when the CLI answers `ok`; otherwise the mod stops sampling for the session and says so
+  once, in a dim transcript line the model does not see. Upgrade or reinstall the CLI when
+  you install the mod.
 - The **statusLine** and **UserPromptSubmit** wiring above stay supported; with the mod they
   are optional for Claude. **Grok is unchanged.**
 

@@ -266,20 +266,24 @@ export function ceilingsOf(fitted: Fitted): Ceilings {
  * The working set is measured from this floor: the harness boilerplate the
  * session opened with.
  *
- * 🔑 Policy: the floor is the fill of the session's FIRST response (the first the
- * mod sees, if it arrived mid-session), kept for the session's life and never
- * reset on compaction, which is what the statusLine's transcript scan does for
- * Claude (the Grok path re-seeds after a compaction instead). After a compaction
- * the working set therefore reads near zero until the window grows back past the
- * old floor. This is the one choice here that is policy rather than parity;
- * change it in both places or neither.
+ * 🔑 Policy: the floor is the fill of the session's FIRST response, kept for the
+ * session's life and never reset on compaction, which is what the statusLine's
+ * transcript scan does for Claude (the Grok path re-seeds after a compaction
+ * instead). After a compaction the working set therefore reads near zero until
+ * the window grows back past the old floor. This is the one choice here that is
+ * policy rather than parity; change it in both places or neither.
+ *
+ * A fill is the first response's only while the user has sent at most one
+ * prompt (`turns`). A session the mod meets later (open when it was installed,
+ * or resumed from before) gets no floor at all: one seeded deep into the session
+ * would read its working set as zero, a false GREEN at any saturation.
  */
-export function resolveFloor(storedFloor: number | undefined, tokens: number | undefined): number | undefined {
+export function resolveFloor(storedFloor: number | undefined, tokens: number | undefined, turns: number): number | undefined {
   if (storedFloor !== undefined && storedFloor > 0) {
     return storedFloor
   }
 
-  return tokens !== undefined && tokens > 0 ? tokens : undefined
+  return tokens !== undefined && tokens > 0 && turns <= 1 ? tokens : undefined
 }
 
 export const FLOOR_PREFIX = 'floor:'
@@ -327,7 +331,8 @@ export function bandSpans(working: number, total?: number, window?: number, ceil
 /**
  * The fuel row: statusline_claude() with the engine's figures in place of the
  * transcript scan. Until the live window's first response there is nothing to
- * band, so it shows the same dim placeholder the statusLine does.
+ * band, and in a session with no floor (resolveFloor) no working set to band, so
+ * it shows the same dim placeholder the statusLine does.
  */
 export function fuelSpans(reading: GaugeReading, ceilings: Ceilings = DEFAULT_CEILINGS): Span[] {
   const suffix: Span[] = reading.model ? [...SEP, { text: reading.model, tone: 'plain' }] : []

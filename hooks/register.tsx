@@ -25,6 +25,9 @@ const reading = atom(READING, null)
 /** How often the band re-reads the window between the engine's own measurements. */
 const POLL_MS = 1_500
 
+/** What `context-gauge --record-sample` prints; a CLI from before the mode prints nothing. */
+const SAMPLE_ACK = 'ok'
+
 // The statusLine's ANSI colours as Text props: 32, 33, 38;5;208, 1;31, 1;97;41.
 // A Text takes a colour name or hex; #ff8700 is xterm-256 colour 208.
 const TONES: Record<Tone, Pick<TextProps, 'color' | 'backgroundColor' | 'bold' | 'dimColor'>> = {
@@ -45,8 +48,13 @@ type Held = {
   isPolling: boolean
   /** The reading last written, so a poll that saw nothing new writes nothing. */
   written: string
-  /** Session id → its floor, or undefined once the store was asked and had none. */
-  floors: Map<string, number | undefined>
+  /**
+   * Session id → its floor; undefined once the store was asked and had none,
+   * null once the session proved too far along to seed one (resolveFloor).
+   */
+  floors: Map<string, number | null | undefined>
+  /** True once the CLI failed to acknowledge a sample: none are sent again this load. */
+  isSamplerOff: boolean
 }
 
 /** Python's os.path.expanduser for the one form a path variable uses: a leading ~. */
@@ -62,7 +70,7 @@ async function thresholdsText($: EngineInterface): Promise<string> {
   return path === undefined ? '' : $.fs.read(path).catch(() => '')
 }
 
-/** The session's floor, seeded from its first reading and kept in the store across reloads. */
+/** The session's floor, seeded from its first response and kept in the store across reloads. */
 async function floorFor($: EngineInterface, held: Held, id: string, tokens: number | undefined): Promise<number | undefined> {
   const key = `${FLOOR_PREFIX}${id}`
 
@@ -73,10 +81,17 @@ async function floorFor($: EngineInterface, held: Held, id: string, tokens: numb
   }
 
   const stored = held.floors.get(id)
-  const floor = resolveFloor(stored, tokens)
 
-  if (floor !== undefined && stored === undefined) {
-    held.floors.set(id, floor)
+  if (stored !== undefined || tokens === undefined) {
+    return stored ?? undefined
+  }
+
+  // Asked once per session: the turn count only grows, so a refusal stands.
+  const floor = resolveFloor(stored, tokens, await $.session.turns())
+
+  held.floors.set(id, floor ?? null)
+
+  if (floor !== undefined) {
     await $.store.set(key, floor)
 
     for (const stale of staleFloorKeys(await $.store.keys())) {
@@ -128,12 +143,17 @@ async function poll($: EngineInterface, held: Held): Promise<void> {
 
 /**
  * Hands one reading to the installed CLI's sampler, so the calibration corpus
- * keeps growing without the UserPromptSubmit hook. No CLI, no sample.
+ * keeps growing without the UserPromptSubmit hook. No CLI, no sample; no floor,
+ * no sample either, since its working set would be a guess.
+ *
+ * A CLI from before --record-sample exits 0 and writes nothing, so a sample
+ * counts only when the CLI acknowledges it. The first that is not stops the
+ * sampler for this load, with one line in the transcript saying why.
  */
-async function recordSample($: EngineInterface, value: GaugeReading): Promise<void> {
+async function recordSample($: EngineInterface, held: Held, value: GaugeReading): Promise<void> {
   const home = await $.env.get('HOME')
 
-  if (value.tokens === undefined || !home) {
+  if (held.isSamplerOff || value.tokens === undefined || value.floor === undefined || !home) {
     return
   }
 
@@ -143,18 +163,23 @@ async function recordSample($: EngineInterface, value: GaugeReading): Promise<vo
     return
   }
 
-  const floor = value.floor ?? 0
   const sample = {
     session_id: await $.session.id(),
     harness: 'claude',
-    working: Math.max(0, value.tokens - floor),
+    working: Math.max(0, value.tokens - value.floor),
     total: value.tokens,
-    floor,
+    floor: value.floor,
     window: value.window,
     model: value.model ?? '',
   }
+  const answer = await $.process
+    .run([cli, '--record-sample'], { stdin: JSON.stringify(sample), timeoutMs: 5_000 })
+    .then(run => run.stdout.trim(), () => '')
 
-  await $.process.run([cli, '--record-sample'], { stdin: JSON.stringify(sample), timeoutMs: 5_000 })
+  if (answer !== SAMPLE_ACK) {
+    held.isSamplerOff = true
+    $.ui.log(`context-gauge: ${cli} did not acknowledge --record-sample; no calibration samples this session. Upgrade or reinstall the CLI to resume them.`)
+  }
 }
 
 export const register: Register = on => {
@@ -165,6 +190,7 @@ export const register: Register = on => {
     isPolling: false,
     written: '',
     floors: new Map(),
+    isSamplerOff: false,
   }
 
   on('session.start', async ($, e, next) => {
@@ -195,7 +221,7 @@ export const register: Register = on => {
         const value = await publish($, held, e.context)
 
         if (e.changed.includes('context')) {
-          await recordSample($, value)
+          await recordSample($, held, value)
         }
       } catch {
         // Fail-open: a missed sample is not worth a failed measurement.

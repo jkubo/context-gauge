@@ -596,6 +596,8 @@ def load_window(session_id: str):
 
 
 SAMPLES_MAX_BYTES = 8 * 1024 * 1024
+# What --record-sample prints. The mod (hooks/register.tsx) checks for it.
+RECORD_SAMPLE_ACK = "ok"
 
 
 def _sample_state_path(session_id: str):
@@ -1024,8 +1026,10 @@ def main() -> int:
     if "--record-sample" in args:
         # One reading as JSON on stdin, from a caller that has the figures but no
         # statusLine payload: the Claude Code mod, which reads the engine's own.
-        # Same row, same dedup, same opt-out as the live paths. Silent, and exit 0
-        # whatever arrives: the caller is a UI that must never wait on a sampler.
+        # Same row, same dedup, same opt-out as the live paths. Exit 0 whatever
+        # arrives: the caller is a UI that must never wait on a sampler. The ack
+        # says only that this CLI has the mode; an older one exits 0 in silence,
+        # and the caller must be able to tell the two apart.
         try:
             data = json.load(sys.stdin)
             if isinstance(data, dict) and not _disabled():
@@ -1037,6 +1041,7 @@ def main() -> int:
                 )
         except Exception:
             pass
+        print(RECORD_SAMPLE_ACK)
         return 0
 
     if "--transcript" in args:

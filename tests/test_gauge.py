@@ -1061,8 +1061,11 @@ class TestRecordSampleCli(unittest.TestCase):
 
     The mod has the engine's figures but no statusLine payload, so it hands one
     reading to the CLI. The row must be the one the live paths write, deduped the
-    same way, and the CLI must stay silent and exit 0 whatever it is handed.
+    same way, and the CLI must exit 0 whatever it is handed, answering only the
+    ack: an older CLI exits 0 in silence, and the ack is how the mod tells.
     """
+
+    ACK = (0, gauge.RECORD_SAMPLE_ACK + "\n")
 
     READING = {"session_id": "mod-1", "harness": "claude", "working": 120_000,
                "total": 180_000, "floor": 60_000, "window": 1_000_000, "model": "Opus 5"}
@@ -1080,7 +1083,7 @@ class TestRecordSampleCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as base:
             env = self._env(base)
             rc, out, _ = run(self.READING, extra_args=["--record-sample"], env_extra=env)
-            self.assertEqual((rc, out), (0, ""))
+            self.assertEqual((rc, out), self.ACK)
             rows = self._rows(env)
             self.assertEqual(len(rows), 1)
             row = rows[0]
@@ -1105,10 +1108,10 @@ class TestRecordSampleCli(unittest.TestCase):
             with self.subTest(knob=knob), tempfile.TemporaryDirectory() as base:
                 env = dict(self._env(base), **{knob: "1"})
                 rc, out, _ = run(self.READING, extra_args=["--record-sample"], env_extra=env)
-                self.assertEqual((rc, out), (0, ""))
+                self.assertEqual((rc, out), self.ACK)
                 self.assertEqual(self._rows(env), [])
 
-    def test_anything_else_is_silent_and_writes_nothing(self):
+    def test_anything_else_is_acknowledged_and_writes_nothing(self):
         cases = [
             ("not json", None),
             ("[1, 2]", None),
@@ -1120,7 +1123,7 @@ class TestRecordSampleCli(unittest.TestCase):
             with self.subTest(raw=raw, obj=obj), tempfile.TemporaryDirectory() as base:
                 env = self._env(base)
                 rc, out, _ = run(obj, extra_args=["--record-sample"], env_extra=env, raw_stdin=raw)
-                self.assertEqual((rc, out), (0, ""))
+                self.assertEqual((rc, out), self.ACK)
                 self.assertEqual(self._rows(env), [])
 
 
@@ -1346,6 +1349,10 @@ class TestModParity(unittest.TestCase):
         self.assertEqual(set(found), set(self.FLAGS))
         for const, (name, source) in self.FLAGS.items():
             self.assertEqual(found[const], gauge.band_flag(name, source), f"{const} differs")
+
+    def test_sample_ack_matches(self):
+        found = re.findall(r"^const SAMPLE_ACK = '([^']*)'$", self._source("register.tsx"), re.M)
+        self.assertEqual(found, [gauge.RECORD_SAMPLE_ACK], "the mod no longer checks the CLI's ack")
 
     def test_band_names_and_emoji_match(self):
         found = re.findall(r"\{ name: '([A-Z]+)', emoji: '([^']+)' \}", self._source("gauge.ts"))

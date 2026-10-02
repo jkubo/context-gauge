@@ -84,12 +84,17 @@ describe('the band math is context_gauge.py', () => {
 
 describe('the floor', () => {
   test('is the first reading, and a stored floor outlives every later one', () => {
-    expect(resolveFloor(undefined, undefined)).toBeUndefined()
-    expect(resolveFloor(undefined, 0)).toBeUndefined()
-    expect(resolveFloor(undefined, 61_000)).toBe(61_000)
-    expect(resolveFloor(61_000, 240_000)).toBe(61_000)
+    expect(resolveFloor(undefined, undefined, 0)).toBeUndefined()
+    expect(resolveFloor(undefined, 0, 1)).toBeUndefined()
+    expect(resolveFloor(undefined, 61_000, 1)).toBe(61_000)
+    expect(resolveFloor(61_000, 240_000, 9)).toBe(61_000)
     // After a compaction the fill drops under the floor; the floor stays.
-    expect(resolveFloor(61_000, 30_000)).toBe(61_000)
+    expect(resolveFloor(61_000, 30_000, 9)).toBe(61_000)
+  })
+
+  test('is never seeded past the first prompt: a late fill is not the floor', () => {
+    expect(resolveFloor(undefined, 240_000, 2)).toBeUndefined()
+    expect(resolveFloor(undefined, 240_000, 40)).toBeUndefined()
   })
 
   test('the store keeps the newest floors and drops the oldest', () => {
