@@ -1,6 +1,6 @@
 {
   "name": "context-gauge",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Context-saturation gauge: a band above the prompt that reports the session's reasoning working set (GREEN→BLACK) from Claude Code's own context figures. Advisory telemetry for the operator, not a stop rule.",
   "author": {
     "name": "jkubo"

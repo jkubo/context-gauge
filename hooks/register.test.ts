@@ -253,7 +253,7 @@ describe('the band above the prompt', () => {
     })
   }
 
-  test('is cut to the body width, never wrapped onto a second row', async ($, on) => {
+  test('is cut to the body width, never wrapped onto a second row, by a row that truncates under a Box with no width of its own', async ($, on) => {
     worldOf(on, ORANGE, { store: { 'floor:session-1': 60_000 } })
     const clock = mock.clock(on)
 
@@ -264,7 +264,13 @@ describe('the band above the prompt', () => {
       const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: { ...BAND, bodyColumns: 30 } })
       const row = await ui.find({ type: 'Text', text: /^⛽ 🟠 ORANGE 140K · 20% of 1M ⚑ checkpoint · Opus 5$/ })
 
-      expect(await ui.drawn(), surface).toMatchObject({ type: 'Box', props: { width: 30 } })
+      // The engine refuses a tree that puts its own node (what next() returned) under a Box with a
+      // `width` prop ("does not validate ... drawing the engine's own"), and then no mod's band is drawn.
+      // The Box takes the band's width from its parent; the row truncates inside it.
+      const drawn = await ui.drawn()
+
+      expect(drawn, surface).toMatchObject({ type: 'Box', props: { flexDirection: 'column' } })
+      expect(drawn?.props, surface).not.toHaveProperty('width')
       expect(row, surface).toMatchObject({ props: { wrap: 'truncate-end' } })
       await ui.unmount()
     }

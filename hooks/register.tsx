@@ -311,7 +311,7 @@ export const register: Register = on => {
     const below = await next(e)
 
     return (
-      <Box flexDirection="column" width={e.props.bodyColumns}>
+      <Box flexDirection="column">
         {row}
         {below}
       </Box>
