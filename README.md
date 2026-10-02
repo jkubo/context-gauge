@@ -171,11 +171,25 @@ interface. This repository is one. Installed, it draws the fuel band directly ab
   the statusLine: the band math is a port of `context_gauge.py`, and the Python suite fails
   if the two disagree on a constant or on any case in [`hooks/parity.ts`](hooks/parity.ts).
 - **The floor** is the fill of the session's first response, kept for the session's life
-  with compaction included, as the statusLine's transcript scan has it. A session the mod
-  first meets after that (open when the mod was installed, or resumed from before it) has no
-  floor the mod can know, so its band stays the dim `⛽ …` rather than read it as GREEN.
+  with compaction included, as the statusLine's transcript scan has it. It is seeded only
+  from the first reply, counted from the transcript so a local command (`/effort`, `!` bash)
+  before the first prompt does not hide it, and never from the fill after a compaction: a
+  session that compacts before it has a floor gets none, since that fill is the summary's.
+- **A session with no floor is not left dark.** One the mod first meets after its first reply
+  (open when it was installed, or resumed from before), or whose first reply was interrupted
+  or an API error, has no floor the mod can know. The row then shows the fill and its share
+  of the window, marked `floor?` because the working-set figure is unavailable:
+
+  ```
+  ⛽ 🟡 YELLOW 600K of 1M · 60% · floor?
+  ```
+
+  The band comes from the window-ratio axis alone, from YELLOW up. The full band is the worse
+  of the two axes, so that can only understate it. At a ratio GREEN no band is named, since
+  the working set could still be anywhere (400K of a 1M window is 40%, all of it reasoning
+  context); the numbers are drawn plain. No floor, no calibration sample.
 - **Nothing reaches the model.** The band is drawn for the operator only; the mod adds no
-  prompt context and hooks no tool call.
+  prompt context and hooks no tool call. Its one other hook only observes compactions.
 - **Fitted thresholds** are read from `CONTEXT_GAUGE_THRESHOLDS`, else
   `~/.context-gauge/thresholds.json`, and validated as the CLI validates them.
   `CONTEXT_GAUGE_DISABLE` turns the band off.
@@ -187,7 +201,8 @@ interface. This repository is one. Installed, it draws the fuel band directly ab
   when the CLI answers `ok`; otherwise the mod stops sampling for the session and says so
   once, in a dim transcript line the model does not see.
 - The **statusLine** and **UserPromptSubmit** wiring above stay supported; with the mod they
-  are optional for Claude. **Grok is unchanged.**
+  are optional for Claude, so keep the statusLine wiring until the band is verified on your
+  screen. **Grok is unchanged.**
 
 Needs Claude Code **≥ 2.1.287**. Mods are early access, so the API under the band may change
 between releases.

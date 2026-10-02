@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
+  BANDS,
   bandFlag,
   bandSpans,
   ceilingsOf,
@@ -12,6 +13,7 @@ import {
   fuelSpans,
   pyFixed,
   repliesIn,
+  replacedTranscript,
   resolveBand,
   resolveFloor,
   staleFloorKeys,
@@ -110,6 +112,17 @@ describe('the floor', () => {
     expect(repliesIn([prompt, reply, result, reply, prompt, prompt, prompt, reply])).toBe(2)
   })
 
+  test('only a compaction that replaced the main transcript counts', () => {
+    for (const trigger of ['manual', 'auto', 'plugin']) {
+      expect(replacedTranscript({ trigger }, {}), trigger).toBe(true)
+    }
+
+    // precompute installs nothing; a subagent compacts its own transcript; a veto changes nothing.
+    expect(replacedTranscript({ trigger: 'precompute' }, {})).toBe(false)
+    expect(replacedTranscript({ trigger: 'manual', agentId: 'a1' }, {})).toBe(false)
+    expect(replacedTranscript({ trigger: 'manual' }, { skip: 'off' })).toBe(false)
+  })
+
   test('the store keeps the newest floors and drops the oldest', () => {
     const keys = ['other', 'floor:a', 'floor:b', 'floor:c', 'floor:d']
 
@@ -145,5 +158,65 @@ describe('the fuel row', () => {
   test('a model name cannot carry control characters or run on', () => {
     expect(displayModel('Opus\u001b[2K 5\n')).toBe('Opus[2K 5')
     expect(Array.from(displayModel('x'.repeat(100)))).toHaveLength(64)
+  })
+})
+
+describe('the row of a session whose floor is unknown', () => {
+  const tonesOf = (spans: readonly { text: string; tone: string }[]) =>
+    new Set(spans.filter(span => span.text.trim() !== '' && span.text !== '·').map(span => span.tone))
+
+  test('is the fill and its window share, never a working set, and says the floor is missing', () => {
+    const spans = fuelSpans({ tokens: 600_000, window: 1_000_000, model: 'Opus 5' })
+
+    expect(textOf(spans)).toBe('⛽ 🟡 YELLOW 600K of 1M · 60% · floor? · Opus 5')
+    expect(spans.filter(span => span.tone === 'YELLOW').map(span => span.text)).toEqual(['⛽ 🟡 YELLOW 600K of 1M', '60%'])
+    expect(spans.find(span => span.text === 'floor?')).toEqual({ text: 'floor?', tone: 'dim' })
+  })
+
+  test('names no band at a window-ratio GREEN: the working set could be anything', () => {
+    // 400K of 1M reads 40%, GREEN on the ratio axis, and every token of it could be reasoning context.
+    const spans = fuelSpans({ tokens: 400_000, window: 1_000_000 })
+
+    expect(textOf(spans)).toBe('⛽ 400K of 1M · 40% · floor?')
+    expect(textOf(spans)).not.toMatch(/GREEN|YELLOW|ORANGE|RED|BLACK/)
+    expect([...tonesOf(spans)].sort()).toEqual(['dim', 'plain'])
+  })
+
+  test('carries the window flag, which holds whatever the floor was', () => {
+    expect(textOf(fuelSpans({ tokens: 720_000, window: 1_000_000 }))).toBe('⛽ 🟠 ORANGE 720K of 1M · 72% · floor? ⚑ compaction near')
+    expect(textOf(fuelSpans({ tokens: 900_000, window: 1_000_000 }))).toBe('⛽ 🔴 RED 900K of 1M · 90% · floor? ⚑ compaction imminent')
+    expect(textOf(fuelSpans({ tokens: 960_000, window: 1_000_000 }))).toBe('⛽ ⚫ BLACK 960K of 1M · 96% · floor? ⚑ HANDOFF NOW')
+    expect([...tonesOf(fuelSpans({ tokens: 960_000, window: 1_000_000 }))].sort()).toEqual(['BLACK', 'dim'])
+  })
+
+  test('is a lower bound: whatever floor the session really had, its full band is at least this one', () => {
+    const rank = (name: string) => BANDS.findIndex(band => band.name === name)
+
+    for (const window of [200_000, 1_000_000, 2_000_000]) {
+      for (let tokens = 5_000; tokens <= window; tokens += 5_000) {
+        const shown = fuelSpans({ tokens, window })[0]!.tone
+        const label = `tokens=${tokens} window=${window}`
+
+        expect(shown, label).not.toBe('GREEN')
+
+        for (const floor of [0, 20_000, 60_000, tokens]) {
+          const full = resolveBand(Math.max(0, tokens - floor), tokens, window).name
+
+          if (shown !== 'plain') {
+            expect(rank(full), `${label} floor=${floor}`).toBeGreaterThanOrEqual(rank(shown))
+          }
+        }
+      }
+    }
+  })
+
+  test('follows a fitted ratio axis, and falls back to the placeholder where the window is unknown', () => {
+    const ceilings = ceilingsOf(fittedCeilings(JSON.stringify({
+      ratio: { green_max: 0.2, yellow_max: 0.4, orange_max: 0.6, red_max: 0.8 },
+    })))
+
+    expect(textOf(fuelSpans({ tokens: 300_000, window: 1_000_000 }, ceilings))).toBe('⛽ 🟡 YELLOW 300K of 1M · 30% · floor?')
+    expect(textOf(fuelSpans({ tokens: 300_000, window: 1_000_000 }))).toBe('⛽ 300K of 1M · 30% · floor?')
+    expect(textOf(fuelSpans({ tokens: 100_000, window: 0 }))).toBe('⛽ …')
   })
 })

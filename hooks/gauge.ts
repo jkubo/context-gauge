@@ -274,10 +274,12 @@ export function ceilingsOf(fitted: Fitted): Ceilings {
  * policy rather than parity; change it in both places or neither.
  *
  * A fill is the first response's only while the model has answered the user at
- * most once (`replies`, see repliesIn). A session the mod meets later (open
- * when it was installed, or resumed from before) gets no floor at all: one
- * seeded deep into the session would read its working set as zero, a false
- * GREEN at any saturation.
+ * most once (`replies`, see repliesIn). A session the mod meets later (open when
+ * it was installed, resumed from before, its first reply interrupted) gets no
+ * floor at all: one seeded deep into the session would read its working set as
+ * zero, a false GREEN at any saturation. Nor does one that compacts before it has
+ * a floor (replacedTranscript): the fill after a compaction is the summary's. Such
+ * a session is not left dark; unfloored() draws what is known of it.
  */
 export function resolveFloor(storedFloor: number | undefined, tokens: number | undefined, replies: number): number | undefined {
   if (storedFloor !== undefined && storedFloor > 0) {
@@ -308,6 +310,15 @@ export function repliesIn(rows: readonly Row[]): number {
   }
 
   return replies
+}
+
+/**
+ * Whether a `session.compact` dispatch, answered as `result`, replaced the MAIN
+ * conversation's transcript with a summary: not a subagent's own compaction, not
+ * the `precompute` that installs nothing, not one a hook vetoed.
+ */
+export function replacedTranscript(e: { trigger: string; agentId?: string }, result: { skip?: string }): boolean {
+  return e.agentId === undefined && e.trigger !== 'precompute' && result.skip === undefined
 }
 
 export const FLOOR_PREFIX = 'floor:'
@@ -352,22 +363,61 @@ export function bandSpans(working: number, total?: number, window?: number, ceil
   return spans
 }
 
+/** What the row says in place of a working-set figure it cannot know. */
+export const FLOOR_UNKNOWN = 'floor?'
+
+/**
+ * The row for a session whose floor is unknown (resolveFloor): the fill and the
+ * window are measured, the working set is not, so the band is drawn from the
+ * window-ratio axis alone and the row says the floor is missing.
+ *
+ * 🔑 The true band is the WORSE of the two axes, so the ratio band is a lower
+ * bound on it and a band at or above YELLOW is honest. A ratio GREEN is not: the
+ * working set could still be BLACK (400K of a 1M window reads 40%, GREEN, with
+ * the whole of it reasoning context), so no GREEN is ever claimed here; the
+ * numbers are drawn in the surface's own colour with no band named. The flag is
+ * the window axis's, true whatever the floor.
+ */
+export function unfloored(tokens: number, window: number, ceilings: Ceilings = DEFAULT_CEILINGS): Span[] {
+  const frac = tokens / window
+  const idx = bandIndex(frac, ceilings.ratio)
+  const band = idx > 0 ? (BANDS[idx] ?? BANDS[BANDS.length - 1]!) : undefined
+  const tone: Tone = band?.name ?? 'plain'
+  const fill = `${fmtK(tokens)} of ${fmtWindow(window)}`
+  const spans: Span[] = [
+    { text: band ? `⛽ ${band.emoji} ${band.name} ${fill}` : `⛽ ${fill}`, tone },
+    ...SEP,
+    { text: `${pyFixed(frac * 100, 0)}%`, tone },
+    ...SEP,
+    { text: FLOOR_UNKNOWN, tone: 'dim' },
+  ]
+  const flag = band ? bandFlag(band.name, 'window ratio') : ''
+
+  if (flag) {
+    spans.push({ text: ' ', tone: 'plain' }, { text: flag, tone })
+  }
+
+  return spans
+}
+
 /**
  * The fuel row: statusline_claude() with the engine's figures in place of the
  * transcript scan. Until the live window's first response there is nothing to
- * band, and in a session with no floor (resolveFloor) no working set to band, so
- * it shows the same dim placeholder the statusLine does.
+ * band, so it shows the same dim placeholder the statusLine does. Once there is
+ * a fill, the row is never dark: with the floor it is the full band, without
+ * one (resolveFloor) it is unfloored().
  */
 export function fuelSpans(reading: GaugeReading, ceilings: Ceilings = DEFAULT_CEILINGS): Span[] {
   const suffix: Span[] = reading.model ? [...SEP, { text: reading.model, tone: 'plain' }] : []
+  const { tokens, floor, window } = reading
+  const row: Span[] =
+    tokens === undefined || (floor === undefined && !(window > 0))
+      ? [{ text: '⛽ …', tone: 'dim' }]
+      : floor === undefined
+        ? unfloored(tokens, window, ceilings)
+        : bandSpans(Math.max(0, tokens - floor), tokens, window, ceilings)
 
-  if (reading.tokens === undefined || reading.floor === undefined) {
-    return [{ text: '⛽ …', tone: 'dim' }, ...suffix]
-  }
-
-  const working = Math.max(0, reading.tokens - reading.floor)
-
-  return [...bandSpans(working, reading.tokens, reading.window, ceilings), ...suffix]
+  return [...row, ...suffix]
 }
 
 export const textOf = (spans: readonly Span[]): string => spans.map(span => span.text).join('')

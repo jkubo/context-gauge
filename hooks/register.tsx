@@ -14,6 +14,7 @@ import {
   FLOOR_PREFIX,
   fuelSpans,
   repliesIn,
+  replacedTranscript,
   resolveFloor,
   staleFloorKeys,
   type Ceilings,
@@ -50,8 +51,9 @@ type Held = {
   /** The reading last written, so a poll that saw nothing new writes nothing. */
   written: string
   /**
-   * Session id → its floor; undefined once the store was asked and had none,
-   * null once the session proved too far along to seed one (resolveFloor).
+   * Session id → its floor; undefined once the store was asked and had no
+   * decision, null once the session proved unable to have one (resolveFloor, or
+   * a compaction that came first).
    */
   floors: Map<string, number | null | undefined>
   /** True once the CLI failed to acknowledge a sample: none are sent again this load. */
@@ -71,20 +73,46 @@ async function thresholdsText($: EngineInterface): Promise<string> {
   return path === undefined ? '' : $.fs.read(path).catch(() => '')
 }
 
-/** The session's floor, seeded from its first response and kept in the store across reloads. */
-async function floorFor($: EngineInterface, held: Held, id: string, tokens: number | undefined): Promise<number | undefined> {
-  const key = `${FLOOR_PREFIX}${id}`
+/**
+ * What the store holds for a session in place of a floor it can never have: a
+ * floor is above 0, so 0 is a decision, not a value. It outlives a reload, which
+ * matters because the transcript does not: after a compaction it reads as a
+ * session of one reply, and a fresh load that re-asked would take that fill for
+ * the floor.
+ */
+const NO_FLOOR = 0
 
+/** The session's decision: a floor, null for none possible, undefined while not yet made. */
+async function loadFloor($: EngineInterface, held: Held, id: string): Promise<number | null | undefined> {
   if (!held.floors.has(id)) {
-    const stored = await $.store.get(key)
+    const stored = await $.store.get(`${FLOOR_PREFIX}${id}`)
 
-    held.floors.set(id, typeof stored === 'number' && stored > 0 ? stored : undefined)
+    held.floors.set(id, typeof stored !== 'number' ? undefined : stored > 0 ? stored : null)
   }
 
-  const stored = held.floors.get(id)
+  return held.floors.get(id)
+}
 
-  if (stored !== undefined || tokens === undefined) {
-    return stored ?? undefined
+/** Records the session's decision in memory and in the store, and prunes the oldest. */
+async function keepFloor($: EngineInterface, held: Held, id: string, floor: number | null): Promise<void> {
+  held.floors.set(id, floor)
+  await $.store.set(`${FLOOR_PREFIX}${id}`, floor ?? NO_FLOOR)
+
+  for (const stale of staleFloorKeys(await $.store.keys())) {
+    await $.store.delete(stale)
+  }
+}
+
+/**
+ * The session's floor, seeded from its first response and kept in the store across
+ * reloads. Undefined while the floor is unknown, which the band draws as the fill
+ * alone (unfloored) and never as a working set.
+ */
+async function floorFor($: EngineInterface, held: Held, id: string, tokens: number | undefined): Promise<number | undefined> {
+  const decided = await loadFloor($, held, id)
+
+  if (decided !== undefined || tokens === undefined) {
+    return decided ?? undefined
   }
 
   // Asked once per session: replies only grow, so a refusal stands. A turn count
@@ -92,17 +120,9 @@ async function floorFor($: EngineInterface, held: Held, id: string, tokens: numb
   // replies are counted from the transcript (repliesIn says why).
   const turns = await $.session.turns()
   const replies = turns <= 1 ? turns : repliesIn(await $.session.messages())
-  const floor = resolveFloor(stored, tokens, replies)
+  const floor = resolveFloor(undefined, tokens, replies)
 
-  held.floors.set(id, floor ?? null)
-
-  if (floor !== undefined) {
-    await $.store.set(key, floor)
-
-    for (const stale of staleFloorKeys(await $.store.keys())) {
-      await $.store.delete(stale)
-    }
-  }
+  await keepFloor($, held, id, floor ?? null)
 
   return floor
 }
@@ -218,6 +238,26 @@ export const register: Register = on => {
     }
 
     return next(e)
+  })
+
+  // Observe only. A session that compacts before it has a floor can never have one:
+  // the fill after the compaction is the summary's, not the harness boilerplate's.
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+
+    if (!held.isDisabled && replacedTranscript(e, result)) {
+      try {
+        const id = await $.session.id()
+
+        if ((await loadFloor($, held, id)) === undefined) {
+          await keepFloor($, held, id, null)
+        }
+      } catch {
+        // Fail-open: the replies still gate the floor.
+      }
+    }
+
+    return result
   })
 
   on('session.measure', async ($, e, next) => {

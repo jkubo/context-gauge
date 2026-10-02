@@ -5,7 +5,9 @@
  *
  * `tokens` is absent until the live window's first response (a fresh session,
  * or one just compacted), and so is `floor` until the session's first response,
- * and for good in a session the mod first met after it.
+ * and for good in a session the mod first met after it, one that compacted
+ * before it had one, or one whose first reply was interrupted. With a `tokens`
+ * and no `floor` the band is drawn from the window share alone.
  */
 export type GaugeReading = {
   /** Input tokens the last response was answered over: the window's fill. */

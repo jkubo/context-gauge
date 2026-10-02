@@ -1,5 +1,5 @@
-import type { On, RenderPropsOf, SessionContextUsage, SessionMessage } from 'claude-code'
-import { describe, expect, mock, test } from 'claude-code/testing'
+import type { On, RenderPropsOf, SessionCompactTrigger, SessionContextUsage, SessionMessage } from 'claude-code'
+import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 const PLUGIN = 'context-gauge'
 const SURFACES = ['terminal', 'desktop'] as const
@@ -32,6 +32,8 @@ type World = {
   writes: unknown[]
   logs: string[]
   turnsAsked: number
+  /** What the engine's compaction does when asked: replaces the transcript, or is vetoed. */
+  compaction: 'replaces' | 'vetoed'
 }
 
 function worldOf(
@@ -66,6 +68,7 @@ function worldOf(
     writes: [],
     logs: [],
     turnsAsked: 0,
+    compaction: 'replaces',
   }
 
   mock.env(on, env)
@@ -79,6 +82,7 @@ function worldOf(
   on('session.id', () => ({ value: 'session-1' }))
   on('session.turns', () => (world.turnsAsked++, { value: world.turns }))
   on('session.messages', () => ({ value: world.messages }))
+  on('session.compact', () => (world.compaction === 'vetoed' ? { skip: 'off' } : { messages: [said('user', SUMMARY)] }))
   on('session.model', () => (model === null ? { deny: 'no model' } : { value: model }))
   on('fs.read', ($, e) => {
     const text = world.files.get(e.path)
@@ -102,9 +106,29 @@ function worldOf(
 
 const ORANGE = { tokens: 200_000, window: 1_000_000 }
 
+// What the store holds for a session that can never have a floor: a floor is above 0.
+const NO_FLOOR = 0
+
+const SUMMARY = 'This session is being continued from a previous conversation that ran out of context.'
+
+type Node = { type: string; props?: Record<string, unknown>; children?: (Node | string)[] }
+
+const flat = (node: Node | string): string => (typeof node === 'string' ? node : (node.children ?? []).map(flat).join(''))
+
+/** The fuel row's runs, as drawn: a bare string is the surface's own colour, a Text its props. */
+function runsOf(drawn: unknown): (string | { text: string; props: Record<string, unknown> | undefined })[] {
+  const row = (drawn as Node).children?.[0]
+
+  return (row && typeof row !== 'string' ? (row.children ?? []) : []).map(run =>
+    typeof run === 'string' ? run : { text: flat(run), props: run.props },
+  )
+}
+
 const said = (role: SessionMessage['role'], text: string): SessionMessage => ({ role, text, toolUses: [] })
 // A local command's two rows, as the engine keeps them: user rows, counted as turns.
 const EFFORT = [said('user', '<command-name>/effort</command-name>'), said('user', '<local-command-stdout>Effort: high</local-command-stdout>')]
+// A `!` bash command's two rows, the same way.
+const BASH = [said('user', '<bash-input>ls</bash-input>'), said('user', '<bash-stdout>a</bash-stdout><bash-stderr></bash-stderr>')]
 
 describe('the band above the prompt', () => {
   test('draws the fuel row on top of what the chain beneath drew, on every surface it is raised on', async ($, on) => {
@@ -138,25 +162,45 @@ describe('the band above the prompt', () => {
     RED: { color: 'red', bold: true },
     BLACK: { color: 'whiteBright', backgroundColor: 'red', bold: true },
   } as const
+  const DIM = { dimColor: true }
+  // Fill 60K seeds the floor; each case is a later fill, its working set, and what the row says.
+  const BANDS_DRAWN = [
+    { name: 'GREEN', tokens: 70_000, head: '⛽ 🟢 GREEN 10K', share: '7% of 1M', flag: '' },
+    { name: 'YELLOW', tokens: 130_000, head: '⛽ 🟡 YELLOW 70K', share: '13% of 1M', flag: '' },
+    { name: 'ORANGE', tokens: 200_000, head: '⛽ 🟠 ORANGE 140K', share: '20% of 1M', flag: '⚑ checkpoint' },
+    { name: 'RED', tokens: 260_000, head: '⛽ 🔴 RED 200K', share: '26% of 1M', flag: '⚑ handoff soon' },
+    { name: 'BLACK', tokens: 400_000, head: '⛽ ⚫ BLACK 340K', share: '40% of 1M', flag: '⚑ HANDOFF NOW' },
+  ] as const
 
-  test('every band is drawn in its statusLine colour, which both surfaces accept', async ($, on) => {
+  test('every band is drawn in its statusLine colour, run by run, on both surfaces', async ($, on) => {
     // A colour a surface refuses fails the whole tree, and the engine then draws its
     // own: nothing, here, so the other mods' rows in this band would vanish with ours.
+    // Every run is pinned, not the lead one: the window share, the flag, the dim dots.
     const world = worldOf(on, { tokens: 60_000, window: 1_000_000 })
     const clock = mock.clock(on)
 
     await $.session.start(SESSION)
     await clock.settle()
 
-    for (const [tokens, name] of [[70_000, 'GREEN'], [130_000, 'YELLOW'], [200_000, 'ORANGE'], [260_000, 'RED'], [400_000, 'BLACK']] as const) {
+    for (const { name, tokens, head, share, flag } of BANDS_DRAWN) {
       world.context = { tokens, window: 1_000_000 }
       await clock.advance(1_500)
 
       for (const surface of SURFACES) {
         const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: BAND })
-        const band = await ui.find({ type: 'Text', text: new RegExp(`^⛽ \\S+ ${name} \\S+$`) })
 
-        expect(band?.props, `${surface} ${name}`).toEqual(TONE[name])
+        expect(runsOf(await ui.drawn()), `${surface} ${name}`).toEqual([
+          { text: head, props: TONE[name] },
+          ' ',
+          { text: '·', props: DIM },
+          ' ',
+          { text: share, props: TONE[name] },
+          ...(flag ? [' ', { text: flag, props: TONE[name] }] : []),
+          ' ',
+          { text: '·', props: DIM },
+          ' ',
+          'Opus 5',
+        ])
         await ui.unmount()
       }
     }
@@ -330,30 +374,36 @@ describe('the floor', () => {
     expect(await ui.find({ type: 'Text', text: /RED 120K/ })).toBeDefined()
   })
 
-  test('is seeded at the first reply when a local command opened the session', async ($, on) => {
-    // /effort before the prompt: the engine counts 3 turns at the first response.
-    const world = worldOf(on, { window: 200_000 }, { turns: 3, messages: [...EFFORT, said('user', 'hi')] })
-    const clock = mock.clock(on)
+  for (const [what, rows] of [
+    ['/effort', EFFORT],
+    ['a `!` bash command', BASH],
+    ['/effort and a `!` bash command, each twice', [...EFFORT, ...BASH, ...EFFORT, ...BASH]],
+  ] as const) {
+    test(`is seeded at the first reply when ${what} opened the session`, async ($, on) => {
+      // Local commands before the prompt: the engine counts every user row as a turn at the first response.
+      const world = worldOf(on, { window: 200_000 }, { turns: rows.length + 1, messages: [...rows, said('user', 'hi')] })
+      const clock = mock.clock(on)
 
-    await $.session.start(SESSION)
-    await clock.settle()
-    world.messages = [...world.messages, said('assistant', 'hello')]
-    world.context = { tokens: 61_000, window: 200_000 }
-    await clock.advance(1_500)
-    expect(world.store.get('floor:session-1')).toBe(61_000)
+      await $.session.start(SESSION)
+      await clock.settle()
+      world.messages = [...world.messages, said('assistant', 'hello')]
+      world.context = { tokens: 61_000, window: 200_000 }
+      await clock.advance(1_500)
+      expect(world.store.get('floor:session-1')).toBe(61_000)
 
-    world.context = { tokens: 181_000, window: 200_000 }
-    await clock.advance(1_500)
+      world.context = { tokens: 181_000, window: 200_000 }
+      await clock.advance(1_500)
 
-    for (const surface of SURFACES) {
-      const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: BAND })
+      for (const surface of SURFACES) {
+        const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: BAND })
 
-      expect(await ui.find({ type: 'Text', text: /^⛽ 🔴 RED 120K$/ }), surface).toBeDefined()
-      await ui.unmount()
-    }
-  })
+        expect(await ui.find({ type: 'Text', text: /^⛽ 🔴 RED 120K$/ }), surface).toBeDefined()
+        await ui.unmount()
+      }
+    })
+  }
 
-  test('is not seeded in a session met after its first prompt: no false GREEN', async ($, on) => {
+  test('is not seeded in a session met after its first prompt, and its row says so rather than going dark', async ($, on) => {
     // Open when the mod arrived, or resumed from before it: 400K deep, floor unknown.
     const messages = Array.from({ length: 12 }, (_, i) => [said('user', `prompt ${i}`), said('assistant', `reply ${i}`)]).flat()
     const world = worldOf(on, { tokens: 400_000, window: 1_000_000 }, { turns: 12, messages, files: { [CLI]: '' } })
@@ -364,7 +414,7 @@ describe('the floor', () => {
     await clock.advance(1_500)
     await $.session.measure({ context: { tokens: 410_000, window: 1_000_000 }, rateLimits: [], changed: ['context'] })
 
-    expect(world.store.has('floor:session-1')).toBe(false)
+    expect(world.store.get('floor:session-1')).toBe(NO_FLOOR)
     // A floor this session can never have is asked for once, not on every poll.
     expect(world.turnsAsked).toBe(1)
     // And a sample with a guessed floor would poison the calibration corpus.
@@ -373,10 +423,184 @@ describe('the floor', () => {
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: BAND })
 
-      expect(await ui.find({ type: 'Text', text: /^⛽ …$/ }), surface).toMatchObject({ props: { dimColor: true } })
+      // The fill and its window share are measured, so they are drawn; the working set is not,
+      // so no band is named (41% is GREEN on the ratio axis, which would be a false GREEN).
+      expect((await ui.find({ type: 'Text', text: /floor\?/ }))?.text, surface).toBe('⛽ 410K of 1M · 41% · floor? · Opus 5')
       expect(await ui.find({ text: /GREEN|YELLOW|ORANGE|RED|BLACK/ }), surface).toBeUndefined()
+      expect(runsOf(await ui.drawn()), surface).toEqual([
+        '⛽ 410K of 1M', ' ', { text: '·', props: { dimColor: true } }, ' ', '41%', ' ', { text: '·', props: { dimColor: true } }, ' ',
+        { text: 'floor?', props: { dimColor: true } }, ' ', { text: '·', props: { dimColor: true } }, ' ', 'Opus 5',
+      ])
       await ui.unmount()
     }
+  })
+
+  test('a deep session with no floor still gets the window-ratio band, as a lower bound', async ($, on) => {
+    const messages = Array.from({ length: 12 }, (_, i) => [said('user', `prompt ${i}`), said('assistant', `reply ${i}`)]).flat()
+    const world = worldOf(on, { tokens: 720_000, window: 1_000_000 }, { turns: 12, messages })
+    const clock = mock.clock(on)
+
+    await $.session.start(SESSION)
+    await clock.settle()
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: BAND })
+      const orange = { color: '#ff8700' }
+
+      expect(runsOf(await ui.drawn()), surface).toEqual([
+        { text: '⛽ 🟠 ORANGE 720K of 1M', props: orange }, ' ', { text: '·', props: { dimColor: true } }, ' ',
+        { text: '72%', props: orange }, ' ', { text: '·', props: { dimColor: true } }, ' ',
+        { text: 'floor?', props: { dimColor: true } }, ' ', { text: '⚑ compaction near', props: orange }, ' ',
+        { text: '·', props: { dimColor: true } }, ' ', 'Opus 5',
+      ])
+      await ui.unmount()
+    }
+
+    expect(world.store.get('floor:session-1')).toBe(NO_FLOOR)
+  })
+
+  for (const [what, first] of [
+    ['an interrupted first reply (written with zero usage)', '[Request interrupted by user]'],
+    ['a first reply that was an API error row', 'API Error: 529 overloaded'],
+  ] as const) {
+    test(`is not seeded when ${what} came before the real one, and its row says so`, async ($, on) => {
+      // A zero-usage row is a stub, so the fill is first seen at the SECOND reply: two replies by then.
+      const world = worldOf(on, { tokens: 0, window: 200_000 }, { turns: 1, messages: [said('user', 'hi'), said('assistant', first)], files: { [CLI]: '' } })
+      const clock = mock.clock(on)
+
+      await $.session.start(SESSION)
+      await clock.settle()
+
+      const early = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'AbovePrompt', props: BAND })
+
+      expect((await early.find({ type: 'Text', text: /^⛽ …/ }))?.text).toBe('⛽ … · Opus 5')
+      await early.unmount()
+
+      world.turns = 2
+      world.messages = [...world.messages, said('user', 'again'), said('assistant', 'hello')]
+      world.context = { tokens: 60_000, window: 200_000 }
+      await clock.advance(1_500)
+      await $.session.measure({ context: world.context, rateLimits: [], changed: ['context'] })
+
+      expect(world.store.get('floor:session-1')).toBe(NO_FLOOR)
+      expect(world.runs).toHaveLength(0)
+
+      for (const surface of SURFACES) {
+        const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: BAND })
+
+        expect((await ui.find({ type: 'Text', text: /floor\?/ }))?.text, surface).toBe('⛽ 60K of 200K · 30% · floor? · Opus 5')
+        expect(await ui.find({ text: /GREEN|YELLOW|ORANGE|RED|BLACK/ }), surface).toBeUndefined()
+        await ui.unmount()
+      }
+    })
+  }
+
+  describe('across a compaction', () => {
+    // A resumed session has no live fill until its first response, and 5 replies behind it.
+    const DEEP = Array.from({ length: 5 }, (_, i) => [said('user', `prompt ${i}`), said('assistant', `reply ${i}`)]).flat()
+
+    type Compaction = { trigger: SessionCompactTrigger; agentId?: string; isVetoed?: boolean }
+
+    /** What the store held the moment the compaction was done, before any reply. */
+    let compactedStore: unknown
+
+    /** The resumed session compacts as given, then answers once: the first live fill it has. */
+    async function resumeAndAnswer($: Engine, on: On, compaction?: Compaction) {
+      compactedStore = undefined
+      const world = worldOf(on, { window: 200_000 }, { turns: 5, messages: DEEP, files: { [CLI]: '' } })
+      const clock = mock.clock(on)
+
+      world.compaction = compaction?.isVetoed ? 'vetoed' : 'replaces'
+      await $.session.start(SESSION)
+      await clock.settle()
+
+      if (compaction) {
+        await $.session.compact({ trigger: compaction.trigger, ...(compaction.agentId && { agentId: compaction.agentId }), messages: DEEP })
+        compactedStore = world.store.get('floor:session-1')
+      }
+
+      // After a compaction the transcript is the summary and what came since.
+      world.messages = [said('user', SUMMARY), said('user', 'next'), said('assistant', 'ok')]
+      world.turns = 2
+      world.context = { tokens: 50_000, window: 200_000 }
+      await clock.advance(1_500)
+
+      return world
+    }
+
+    test('control: the same first reply with no compaction before it IS the floor', async ($, on) => {
+      const world = await resumeAndAnswer($, on)
+
+      expect(world.store.get('floor:session-1')).toBe(50_000)
+    })
+
+    for (const trigger of ['manual', 'auto', 'plugin'] as const) {
+      test(`a compaction (${trigger}) before any floor was seeded: the fill after it is not the floor`, async ($, on) => {
+        const world = await resumeAndAnswer($, on, { trigger })
+
+        // Decided at the compaction, so a reload before the first reply cannot undo it.
+        expect(compactedStore).toBe(NO_FLOOR)
+        expect(world.store.get('floor:session-1')).toBe(NO_FLOOR)
+        expect(world.runs).toHaveLength(0)
+
+        for (const surface of SURFACES) {
+          const ui = await $.ui.mount({ plugin: PLUGIN, surface, component: 'AbovePrompt', props: BAND })
+
+          // The fill is still drawn, as the window share; the summary's size is not a working set.
+          expect((await ui.find({ type: 'Text', text: /floor\?/ }))?.text, surface).toBe('⛽ 50K of 200K · 25% · floor? · Opus 5')
+          await ui.unmount()
+        }
+      })
+    }
+
+    for (const [what, compaction] of [
+      ['one a hook vetoed changed nothing', { trigger: 'manual', isVetoed: true }],
+      ['a precompute installs nothing', { trigger: 'precompute' }],
+      ['a subagent compacts its own transcript, not this one', { trigger: 'auto', agentId: 'agent-1' }],
+    ] as const satisfies readonly (readonly [string, Compaction])[]) {
+      test(`${what}, so it does not count`, async ($, on) => {
+        const world = await resumeAndAnswer($, on, compaction)
+
+        expect(world.store.get('floor:session-1')).toBe(50_000)
+      })
+    }
+
+    test('a refusal outlives a reload: the transcript no longer shows a deep session', async ($, on) => {
+      // The store says this session can have no floor; its transcript, compacted, says one reply.
+      const world = worldOf(on, { tokens: 50_000, window: 200_000 }, {
+        turns: 2,
+        messages: [said('user', SUMMARY), said('user', 'next'), said('assistant', 'ok')],
+        store: { 'floor:session-1': NO_FLOOR },
+      })
+      const clock = mock.clock(on)
+
+      await $.session.start(SESSION)
+      await clock.settle()
+
+      expect(world.store.get('floor:session-1')).toBe(NO_FLOOR)
+      expect(world.turnsAsked).toBe(0)
+
+      const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'AbovePrompt', props: BAND })
+
+      expect((await ui.find({ type: 'Text', text: /floor\?/ }))?.text).toBe('⛽ 50K of 200K · 25% · floor? · Opus 5')
+    })
+
+    test('seeded before one, the floor stands: the policy is never to reset it', async ($, on) => {
+      const world = worldOf(on, { tokens: 61_000, window: 200_000 })
+      const clock = mock.clock(on)
+
+      await $.session.start(SESSION)
+      await clock.settle()
+      await $.session.compact({ trigger: 'manual', messages: DEEP })
+      world.context = { tokens: 30_000, window: 200_000 }
+      await clock.advance(1_500)
+
+      expect(world.store.get('floor:session-1')).toBe(61_000)
+
+      const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'AbovePrompt', props: BAND })
+
+      expect((await ui.find({ type: 'Text', text: /GREEN/ }))?.text).toBe('⛽ 🟢 GREEN 0K · 15% of 200K · Opus 5')
+    })
   })
 
   test('seeding one keeps the newest floors in the store and drops the oldest', async ($, on) => {
