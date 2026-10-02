@@ -78,6 +78,7 @@ CLI:
   context-gauge --transcript FILE.jsonl          # Claude
   context-gauge --session-dir DIR                # Grok
   context-gauge --signals FILE.json              # Grok
+  context-gauge --record-sample < READING.json   # one sample row (the Claude Code mod)
 """
 from __future__ import annotations
 
@@ -1018,6 +1019,24 @@ def main() -> int:
         i = args.index("--calibrate") + 1
         path = args[i] if i < len(args) and not args[i].startswith("-") else None
         print(calibrate(path))
+        return 0
+
+    if "--record-sample" in args:
+        # One reading as JSON on stdin, from a caller that has the figures but no
+        # statusLine payload: the Claude Code mod, which reads the engine's own.
+        # Same row, same dedup, same opt-out as the live paths. Silent, and exit 0
+        # whatever arrives: the caller is a UI that must never wait on a sampler.
+        try:
+            data = json.load(sys.stdin)
+            if isinstance(data, dict) and not _disabled():
+                record_sample(
+                    data.get("session_id") or "",
+                    "grok" if data.get("harness") == "grok" else "claude",
+                    data.get("working"), data.get("total"), data.get("floor"),
+                    data.get("window"), data.get("model") or "", data.get("effort") or "",
+                )
+        except Exception:
+            pass
         return 0
 
     if "--transcript" in args:

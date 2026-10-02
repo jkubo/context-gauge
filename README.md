@@ -49,10 +49,11 @@ what to do about it is theirs.
 
 | Harness | Integration | Fill source | Floor |
 |---------|-------------|-------------|-------|
+| **Claude Code** (mod) | band above the prompt | the engine's own context figures | first response |
 | **Claude Code** | `statusLine` + `UserPromptSubmit` | transcript `usage` (`input + cache_read + cache_creation`) | first main assistant turn |
 | **Grok Build** | `UserPromptSubmit` (+ `SessionStart` / `PostCompact` seed) | `signals.json` → `contextTokensUsed` | first observation (re-seed after compact) |
 
-Auto-dispatch: stdin with `transcript_path` → Claude; `sessionId` / `GROK_SESSION_ID` → Grok.
+Auto-dispatch: stdin with `transcript_path` → Claude; `sessionId` / `GROK_SESSION_ID` → Grok. The mod is not dispatched; Claude Code loads it as a plugin (see [Claude Code mod](#claude-code-mod)).
 
 ---
 
@@ -125,7 +126,7 @@ Merge into `~/.claude/settings.json` (see [`settings.example.json`](settings.exa
 }
 ```
 
-`statusLine` needs a recent Claude Code (present as of **v2.1.212**). Use either or both integrations.
+`statusLine` needs a recent Claude Code (present as of **v2.1.212**). Use either or both integrations. With the [Claude Code mod](#claude-code-mod) installed, both are optional for Claude.
 
 ### Grok Build
 
@@ -148,6 +149,44 @@ Copy [`hooks.grok.example.json`](hooks.grok.example.json) to `~/.grok/hooks/cont
 ```
 
 Grok has no `statusLine` yet — inject-only.
+
+---
+
+## Claude Code mod
+
+Claude Code **2.1.287** added mods: plugins of function hooks that can draw inside the
+interface. This repository is one. Installed, it draws the fuel band directly above the prompt:
+
+```
+⛽ 🟠 ORANGE 140K · 20% of 1M ⚑ checkpoint · Opus 5
+```
+
+```
+/plugin marketplace add jkubo/context-gauge
+/plugin install context-gauge@context-gauge
+```
+
+- **Claude Code's own figures, no transcript scan.** The mod reads the live context window
+  from the engine every 1.5 s and after each turn. Same bands, same thresholds, same flags as
+  the statusLine: the band math is a port of `context_gauge.py`, and the Python suite fails
+  if the two disagree on a constant or on any case in [`hooks/parity.ts`](hooks/parity.ts).
+- **The floor** is the fill of the first response the mod sees in a session (the session's
+  first, unless the mod arrived mid-session), kept for the session's life with compaction
+  included, as the statusLine's transcript scan has it.
+- **Nothing reaches the model.** The band is drawn for the operator only; the mod adds no
+  prompt context and hooks no tool call.
+- **Fitted thresholds** are read from `CONTEXT_GAUGE_THRESHOLDS`, else
+  `~/.context-gauge/thresholds.json`, and validated as the CLI validates them.
+  `CONTEXT_GAUGE_DISABLE` turns the band off.
+- **Calibration samples** keep flowing when the CLI is installed at
+  `~/.local/bin/context-gauge`: the mod hands each measurement to
+  `context-gauge --record-sample`, which writes the row the live paths write
+  (`CONTEXT_GAUGE_NO_SAMPLES` still opts out). Without the CLI the mod samples nothing.
+- The **statusLine** and **UserPromptSubmit** wiring above stay supported; with the mod they
+  are optional for Claude. **Grok is unchanged.**
+
+Needs Claude Code **≥ 2.1.287**. Mods are early access, so the API under the band may change
+between releases.
 
 ---
 
@@ -179,6 +218,7 @@ context-gauge --self-test                 # print all five bands
 context-gauge --transcript FILE.jsonl     # Claude: hook + status lines
 context-gauge --session-dir DIR           # Grok: one reading from signals.json
 context-gauge --signals FILE.json         # Grok: direct signals file
+context-gauge --record-sample < R.json    # one calibration row (the mod's sampler)
 ```
 
 ---
@@ -189,6 +229,10 @@ context-gauge --signals FILE.json         # Grok: direct signals file
 python3 -m pytest tests/ -v
 # or
 python3 -m unittest tests.test_gauge -v
+
+# the Claude Code mod (Claude Code >= 2.1.287)
+claude plugin validate . --strict
+claude plugin test .
 ```
 
 ## Packaging / release

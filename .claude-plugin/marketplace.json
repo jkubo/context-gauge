@@ -1,0 +1,15 @@
+{
+  "name": "context-gauge",
+  "description": "context-gauge: a context-saturation gauge for Claude Code.",
+  "owner": {
+    "name": "jkubo"
+  },
+  "plugins": [
+    {
+      "name": "context-gauge",
+      "source": "./",
+      "description": "Context-saturation gauge: a band above the prompt that reports the session's reasoning working set (GREEN→BLACK) from Claude Code's own context figures.",
+      "homepage": "https://github.com/jkubo/context-gauge"
+    }
+  ]
+}

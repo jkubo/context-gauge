@@ -1,0 +1,13 @@
+{
+  "name": "context-gauge",
+  "version": "0.2.1",
+  "description": "Context-saturation gauge: a band above the prompt that reports the session's reasoning working set (GREEN→BLACK) from Claude Code's own context figures. Advisory telemetry for the operator, not a stop rule.",
+  "author": {
+    "name": "jkubo"
+  },
+  "homepage": "https://github.com/jkubo/context-gauge",
+  "repository": "https://github.com/jkubo/context-gauge",
+  "license": "Apache-2.0",
+  "keywords": ["context", "tokens", "gauge", "statusline"],
+  "types": "./types/index.d.ts"
+}

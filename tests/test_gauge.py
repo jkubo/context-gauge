@@ -10,6 +10,7 @@ Run:  python3 -m pytest tests/ -v      (or)      python3 tests/test_gauge.py
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1055,6 +1056,74 @@ class TestSampleCollection(unittest.TestCase):
             self.assertIn("nothing collected yet", out)
 
 
+class TestRecordSampleCli(unittest.TestCase):
+    """`--record-sample`: the Claude Code mod's way into the calibration corpus.
+
+    The mod has the engine's figures but no statusLine payload, so it hands one
+    reading to the CLI. The row must be the one the live paths write, deduped the
+    same way, and the CLI must stay silent and exit 0 whatever it is handed.
+    """
+
+    READING = {"session_id": "mod-1", "harness": "claude", "working": 120_000,
+               "total": 180_000, "floor": 60_000, "window": 1_000_000, "model": "Opus 5"}
+
+    def _env(self, base):
+        return {"CONTEXT_GAUGE_FLOOR_DIR": os.path.join(base, "floors"),
+                "CONTEXT_GAUGE_SAMPLES": os.path.join(base, "samples.jsonl"),
+                "CONTEXT_GAUGE_NO_SAMPLES": ""}
+
+    def _rows(self, env):
+        path = Path(env["CONTEXT_GAUGE_SAMPLES"])
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_one_reading_is_one_row_of_the_live_schema(self):
+        with tempfile.TemporaryDirectory() as base:
+            env = self._env(base)
+            rc, out, _ = run(self.READING, extra_args=["--record-sample"], env_extra=env)
+            self.assertEqual((rc, out), (0, ""))
+            rows = self._rows(env)
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(set(row), {"ts", "session", "harness", "working", "total",
+                                        "floor", "window", "model", "effort"})
+            self.assertEqual((row["session"], row["harness"]), ("mod-1", "claude"))
+            self.assertEqual((row["working"], row["total"], row["floor"], row["window"]),
+                             (120_000, 180_000, 60_000, 1_000_000))
+            self.assertEqual((row["model"], row["effort"]), ("Opus 5", ""))
+
+    def test_an_unmoved_fill_is_not_a_second_row(self):
+        with tempfile.TemporaryDirectory() as base:
+            env = self._env(base)
+            for _ in range(3):
+                run(self.READING, extra_args=["--record-sample"], env_extra=env)
+            run(dict(self.READING, total=190_000, working=130_000),
+                extra_args=["--record-sample"], env_extra=env)
+            self.assertEqual([r["total"] for r in self._rows(env)], [180_000, 190_000])
+
+    def test_opt_out_and_kill_switch_collect_nothing(self):
+        for knob in ("CONTEXT_GAUGE_NO_SAMPLES", "CONTEXT_GAUGE_DISABLE"):
+            with self.subTest(knob=knob), tempfile.TemporaryDirectory() as base:
+                env = dict(self._env(base), **{knob: "1"})
+                rc, out, _ = run(self.READING, extra_args=["--record-sample"], env_extra=env)
+                self.assertEqual((rc, out), (0, ""))
+                self.assertEqual(self._rows(env), [])
+
+    def test_anything_else_is_silent_and_writes_nothing(self):
+        cases = [
+            ("not json", None),
+            ("[1, 2]", None),
+            (None, dict(self.READING, session_id="../escape")),
+            (None, dict(self.READING, total=0)),
+            (None, dict(self.READING, working="lots")),
+        ]
+        for raw, obj in cases:
+            with self.subTest(raw=raw, obj=obj), tempfile.TemporaryDirectory() as base:
+                env = self._env(base)
+                rc, out, _ = run(obj, extra_args=["--record-sample"], env_extra=env, raw_stdin=raw)
+                self.assertEqual((rc, out), (0, ""))
+                self.assertEqual(self._rows(env), [])
+
+
 class TestFittedThresholds(unittest.TestCase):
     """The read side of the loop: gaius fits, the gauge obeys — or ignores safely."""
 
@@ -1233,6 +1302,83 @@ class TestDocsDoNotReintroduceTheImperative(unittest.TestCase):
         readme = self._read("README.md")
         self.assertIn("do not instruct the agent", readme.lower())
         self.assertIn("TestBandLabelsCarryNoImperative", readme)
+
+
+class TestModParity(unittest.TestCase):
+    """The Claude Code mod carries a TypeScript port of the band math (hooks/gauge.ts).
+
+    Two copies of one table drift the moment someone tunes only one of them, which
+    is how this project once shipped a Grok-less binary. So the constants are read
+    straight out of the TypeScript source and compared with this module's, and the
+    cases in hooks/parity.ts, which the mod's own tests run too, are run here
+    through the Python side. A change on either side alone reds this suite.
+    """
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    THRESHOLDS = ("GREEN_MAX", "YELLOW_MAX", "ORANGE_MAX", "RED_MAX",
+                  "RATIO_GREEN_MAX", "RATIO_YELLOW_MAX", "RATIO_ORANGE_MAX", "RATIO_RED_MAX",
+                  "COMPACTION_WARN_RATIO")
+    # Each flag constant, and a (band, axis) that band_flag() answers it for.
+    FLAGS = {"FLAG_CHECKPOINT": ("ORANGE", "working set"),
+             "FLAG_COMPACTION_NEAR": ("ORANGE", "window ratio"),
+             "FLAG_HANDOFF_SOON": ("RED", "working set"),
+             "FLAG_COMPACTION_IMMINENT": ("RED", "both"),
+             "FLAG_HANDOFF_NOW": ("BLACK", "working set")}
+
+    def _source(self, name):
+        with open(os.path.join(self.ROOT, "hooks", name), encoding="utf-8") as fh:
+            return fh.read()
+
+    def _parity(self):
+        m = re.search(r"^export const PARITY = (\{.*\})\s*\Z", self._source("parity.ts"), re.M | re.S)
+        self.assertIsNotNone(m, "hooks/parity.ts no longer exports PARITY as a JSON object")
+        return json.loads(m.group(1))
+
+    def test_thresholds_match(self):
+        found = {k: float(v.replace("_", "")) for k, v in
+                 re.findall(r"^export const ([A-Z_]+) = ([0-9_.]+)$", self._source("gauge.ts"), re.M)}
+        for name in self.THRESHOLDS:
+            self.assertIn(name, found, f"hooks/gauge.ts no longer declares {name}")
+            self.assertEqual(found[name], getattr(gauge, name), f"{name} differs between the gauges")
+
+    def test_flags_match(self):
+        found = dict(re.findall(r"^export const (FLAG_[A-Z_]+) = '([^']*)'$", self._source("gauge.ts"), re.M))
+        self.assertEqual(set(found), set(self.FLAGS))
+        for const, (name, source) in self.FLAGS.items():
+            self.assertEqual(found[const], gauge.band_flag(name, source), f"{const} differs")
+
+    def test_band_names_and_emoji_match(self):
+        found = re.findall(r"\{ name: '([A-Z]+)', emoji: '([^']+)' \}", self._source("gauge.ts"))
+        self.assertEqual(found, [(b[1], b[2]) for b in gauge.BANDS])
+
+    def test_shared_band_cases(self):
+        ansi = re.compile(r"\x1b\[[0-9;]*m")
+        cases = self._parity()["bands"]
+        self.assertGreater(len(cases), 0)
+        for c in cases:
+            with self.subTest(case=c):
+                name, _emoji, _label, source, _frac = gauge.resolve_band(c["working"], c["total"], c["window"])
+                self.assertEqual((name, source), (c["name"], c["source"]))
+                bar = gauge.band_segment(c["working"], c["total"], c["window"])
+                self.assertEqual(ansi.sub("", bar), c["text"])
+
+    def test_shared_threshold_files(self):
+        cases = self._parity()["fitted"]
+        self.assertGreater(len(cases), 0)
+        with tempfile.TemporaryDirectory() as base:
+            path = os.path.join(base, "thresholds.json")
+            os.environ["CONTEXT_GAUGE_THRESHOLDS"] = path
+            try:
+                for c in cases:
+                    with self.subTest(text=c["text"]):
+                        Path(path).write_text(c["text"], encoding="utf-8")
+                        gauge._TUNED = None
+                        got = {axis: list(v[:4]) for axis, v in gauge._tuned().items()}
+                        self.assertEqual(got, c["expect"])
+            finally:
+                gauge._TUNED = None
+                os.environ["CONTEXT_GAUGE_THRESHOLDS"] = NO_THRESHOLDS
+
 
 if __name__ == "__main__":
     unittest.main()
