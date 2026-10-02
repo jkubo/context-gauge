@@ -49,10 +49,11 @@ what to do about it is theirs.
 
 | Harness | Integration | Fill source | Floor |
 |---------|-------------|-------------|-------|
+| **Claude Code** (mod) | band above the prompt | the engine's own context figures | first response |
 | **Claude Code** | `statusLine` + `UserPromptSubmit` | transcript `usage` (`input + cache_read + cache_creation`) | first main assistant turn |
 | **Grok Build** | `UserPromptSubmit` (+ `SessionStart` / `PostCompact` seed) | `signals.json` → `contextTokensUsed` | first observation (re-seed after compact) |
 
-Auto-dispatch: stdin with `transcript_path` → Claude; `sessionId` / `GROK_SESSION_ID` → Grok.
+Auto-dispatch: stdin with `transcript_path` → Claude; `sessionId` / `GROK_SESSION_ID` → Grok. The mod is not dispatched; Claude Code loads it as a plugin (see [Claude Code mod](#claude-code-mod)).
 
 ---
 
@@ -125,7 +126,7 @@ Merge into `~/.claude/settings.json` (see [`settings.example.json`](settings.exa
 }
 ```
 
-`statusLine` needs a recent Claude Code (present as of **v2.1.212**). Use either or both integrations.
+`statusLine` needs a recent Claude Code (present as of **v2.1.212**). Use either or both integrations. With the [Claude Code mod](#claude-code-mod) installed, both are optional for Claude.
 
 ### Grok Build
 
@@ -151,6 +152,63 @@ Grok has no `statusLine` yet — inject-only.
 
 ---
 
+## Claude Code mod
+
+Claude Code **2.1.287** added mods: plugins of function hooks that can draw inside the
+interface. This repository is one. Installed, it draws the fuel band directly above the prompt:
+
+```
+⛽ 🟠 ORANGE 140K · 20% of 1M ⚑ checkpoint · Opus 5
+```
+
+```
+/plugin marketplace add jkubo/context-gauge
+/plugin install context-gauge@context-gauge
+```
+
+- **Claude Code's own figures, no transcript scan.** The mod reads the live context window
+  from the engine every 1.5 s and after each turn. Same bands, same thresholds, same flags as
+  the statusLine: the band math is a port of `context_gauge.py`, and the Python suite fails
+  if the two disagree on a constant or on any case in [`hooks/parity.ts`](hooks/parity.ts).
+- **The floor** is the fill of the session's first response, kept for the session's life
+  with compaction included, as the statusLine's transcript scan has it. It is seeded only
+  from the first reply, counted from the transcript so a local command (`/effort`, `!` bash)
+  before the first prompt does not hide it, and never from the fill after a compaction: a
+  session that compacts before it has a floor gets none, since that fill is the summary's.
+- **A session with no floor is not left dark.** One the mod first meets after its first reply
+  (open when it was installed, or resumed from before), or whose first reply was interrupted
+  or an API error, has no floor the mod can know. The row then shows the fill and its share
+  of the window, marked `floor?` because the working-set figure is unavailable:
+
+  ```
+  ⛽ 🟡 YELLOW 600K of 1M · 60% · floor?
+  ```
+
+  The band comes from the window-ratio axis alone, from YELLOW up. The full band is the worse
+  of the two axes, so that can only understate it. At a ratio GREEN no band is named, since
+  the working set could still be anywhere (400K of a 1M window is 40%, all of it reasoning
+  context); the numbers are drawn plain. No floor, no calibration sample.
+- **Nothing reaches the model.** The band is drawn for the operator only; the mod adds no
+  prompt context and hooks no tool call. Its one other hook only observes compactions.
+- **Fitted thresholds** are read from `CONTEXT_GAUGE_THRESHOLDS`, else
+  `~/.context-gauge/thresholds.json`, and validated as the CLI validates them.
+  `CONTEXT_GAUGE_DISABLE` turns the band off.
+- **Calibration samples** keep flowing when the CLI is installed at
+  `~/.local/bin/context-gauge`: the mod hands each measurement to
+  `context-gauge --record-sample`, which writes the row the live paths write
+  (`CONTEXT_GAUGE_NO_SAMPLES` still opts out). Without the CLI the mod samples nothing.
+  A CLI from before `--record-sample` exits 0 and writes nothing, so a sample counts only
+  when the CLI answers `ok`; otherwise the mod stops sampling for the session and says so
+  once, in a dim transcript line the model does not see.
+- The **statusLine** and **UserPromptSubmit** wiring above stay supported; with the mod they
+  are optional for Claude, so keep the statusLine wiring until the band is verified on your
+  screen. **Grok is unchanged.**
+
+Needs Claude Code **≥ 2.1.287**. Mods are early access, so the API under the band may change
+between releases.
+
+---
+
 ## Configuration (optional env vars)
 
 | Variable | Default | Effect |
@@ -161,50 +219,6 @@ Grok has no `statusLine` yet — inject-only.
 | `CLAUDE_CONTEXT_GAUGE_WINDOW` | — | Legacy alias. |
 | `CONTEXT_GAUGE_FLOOR_DIR` | `~/.context-gauge/floors` | Grok floor cache directory. |
 | `GROK_HOME` | `~/.grok` | Grok sessions root. |
-| `CONTEXT_GAUGE_CHILDREN` | `1` | `0`/`false`/`off` → hide the tessera children strip. |
-| `CONTEXT_GAUGE_CHILDREN_ALL` | *(unset)* | Truthy → show every live tessera, not just this session's. |
-
----
-
-## Tessera children strip
-
-If `~/.gaius/tessera` has running units, the Claude statusLine grows a second
-block under the fuel bar — a header with the fleet count and fence mix, then one
-row per unit:
-
-```
-⛽ 🟠 ORANGE 140K · 22% of 1M ⚑ checkpoint · Opus 5
-⬡ 9 tesserae · 8 read · 1 build
- ├ referee-order-v2  f596f9  16m ⚡
- ├ sop-tessera-yaml  afd365  22h
- ├ contract-p13      bb94f4  30m
- └ +6 more
-```
-
-Bounded at `1 + CHILDREN_MAX` (5) rows at any fleet width, so a wide fan-out
-cannot push the prompt off screen. When more units are running than fit, the
-rows go to the ones you could *not* have guessed: any `build` fence first (the
-only unit that can write), then the oldest (a straggler from an earlier round —
-a unit spawned 40s ago is fine by definition). `⚡` marks a build fence.
-
-Discovery is two `os.listdir` calls; a unit is running iff `live/<id>.ndjson`
-exists and `raw/<id>.json` does not. **No child transcript is ever opened** —
-the age comes from the id's own UTC stamp, so a FIFO in `live/` cannot hang the
-status bar. Names come from the ledger's `issue.unit` through a whole-string
-allowlist that refuses rather than strips, since a *partially* sanitized name
-would still claim to identify a unit that is not the one running.
-
-The name column is 32 columns and elides end-first with a flush `…`, matching
-Claude Code's own `truncateToWidth`. 32 is measured, not chosen: across 239
-real unit slugs the median is 19 and the max is 32, so the ellipsis is a rare
-exception rather than something a quarter of rows hit. The column auto-sizes to
-the widest *visible* name, so a fleet of short names still renders a tight strip.
-
-By default the strip shows only units issued by the current session
-(`issue.manager_session` vs `CLAUDE_CODE_SESSION_ID`); parallel sessions on one
-box do not bleed into each other's bars. It fails open — an unreadable ledger
-lists the ids unnamed rather than blanking the strip, because an empty strip
-reads identically to "nothing is running".
 
 ---
 
@@ -223,6 +237,7 @@ context-gauge --self-test                 # print all five bands
 context-gauge --transcript FILE.jsonl     # Claude: hook + status lines
 context-gauge --session-dir DIR           # Grok: one reading from signals.json
 context-gauge --signals FILE.json         # Grok: direct signals file
+context-gauge --record-sample < R.json    # one calibration row (the mod's sampler)
 ```
 
 ---
@@ -233,6 +248,10 @@ context-gauge --signals FILE.json         # Grok: direct signals file
 python3 -m pytest tests/ -v
 # or
 python3 -m unittest tests.test_gauge -v
+
+# the Claude Code mod (Claude Code >= 2.1.287)
+claude plugin validate . --strict
+claude plugin test .
 ```
 
 ## Packaging / release

@@ -63,9 +63,6 @@ CONFIG (optional env vars):
   CONTEXT_GAUGE_WINDOW           pin the Claude window (else read from harness)
   CLAUDE_CONTEXT_GAUGE_WINDOW    legacy alias
   CONTEXT_GAUGE_FLOOR_DIR        Grok floor cache dir (default ~/.context-gauge/floors)
-  CONTEXT_GAUGE_CHILDREN         0/false/off → hide the tessera children strip
-  CONTEXT_GAUGE_CHILDREN_ALL     1/true/on → disable the session filter (show every live tessera)
-  CONTEXT_GAUGE_TESSERA_ROOT     test-only override of ~/.gaius/tessera
   CONTEXT_GAUGE_SAMPLES          sample log (default ~/.context-gauge/samples.jsonl)
   CONTEXT_GAUGE_NO_SAMPLES       any truthy → collect nothing
   CONTEXT_GAUGE_THRESHOLDS       fitted band ceilings (default ~/.context-gauge/thresholds.json)
@@ -81,10 +78,10 @@ CLI:
   context-gauge --transcript FILE.jsonl          # Claude
   context-gauge --session-dir DIR                # Grok
   context-gauge --signals FILE.json              # Grok
+  context-gauge --record-sample < READING.json   # one sample row (the Claude Code mod)
 """
 from __future__ import annotations
 
-import calendar
 import json
 import os
 import re
@@ -599,6 +596,8 @@ def load_window(session_id: str):
 
 
 SAMPLES_MAX_BYTES = 8 * 1024 * 1024
+# What --record-sample prints. The mod (hooks/register.tsx) checks for it.
+RECORD_SAMPLE_ACK = "ok"
 
 
 def _sample_state_path(session_id: str):
@@ -1000,402 +999,6 @@ def _looks_like_grok(data: dict) -> bool:
     return bool(os.environ.get("GROK_SESSION_ID"))
 
 
-# ── tessera children strip (statusLine extra rows) ────────────────────────────
-# Still-running ⇔ live/<id>.ndjson exists AND raw/<id>.json does not.
-# Discovery is two os.listdir calls. Never open, stat, or read an ndjson.
-# The ledger join reads issue rows for two purposes: session scope (keep a row
-# only when issue.manager_session matches CLAUDE_CODE_SESSION_ID, both sides
-# through safe_session_id — that field is never printed) and the display name.
-#
-# issue.unit IS printed, and it is the only executor-adjacent free text on this
-# surface. It goes through safe_unit: whole-string allowlist, refuse-not-strip,
-# so a name that could repaint the terminal is dropped rather than mangled into
-# something that still claims to identify a unit. Everything else displayed is
-# derived: the short is the last 6 of an already-_SAFE_TID id, the age is
-# arithmetic on that id's own timestamp, the fence is matched against a closed
-# set. Nothing here opens a child transcript.
-
-_SAFE_TID = re.compile(r"\A[TV]-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}\Z")
-# Rows are the scarce resource: the strip must never push the prompt off-screen.
-# n <= CHILDREN_MAX renders n rows; beyond that the tail collapses so the strip
-# is at most 1 header + CHILDREN_MAX rows regardless of fleet width.
-CHILDREN_MAX = 4
-# 32 columns. Measured against the real ledger (239 distinct unit slugs):
-# median 19, p90 26, max 32 — so 32 shows 100% of them whole and the ellipsis
-# becomes what it should be, an exception rather than a quarter of all rows.
-# At 22 it fired on 25% of units. It is also the one named 32-column width in
-# Claude Code itself (Jsc, feeding truncatePathMiddle), so the strip is not
-# inventing a number. The name column auto-sizes to the widest *visible* name,
-# so raising this costs nothing on a fleet of short names.
-_NAME_MAX = 32
-_NO_NAME = "—"
-_TESSERA_ROOT_DEFAULT = Path.home() / ".gaius" / "tessera"
-
-# The ledger is written by the manager but read by a renderer that prints to a
-# terminal, so treat it as untrusted. safe_session_id (whole-string match, empty
-# on failure) is the right model to mirror — not safe_model, which strips bad
-# characters and returns the remainder. A stripped name is a lie: "corpus\x1b[2K"
-# reduced to "corpus" claims to be a unit that is not the one running.
-_SAFE_UNIT = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
-_FENCES = ("read", "build")
-_TERMINAL_KINDS = frozenset({"revoke", "return", "verify", "complete"})
-# Quoted so compact `"kind":"revoke"` still matches. Prefilter only — parsed
-# `kind` is the gate (test_nested_issue_token_does_not_bypass_the_kind_check).
-_LEDGER_KEEP_TOKENS = ('"issue"', '"revoke"', '"return"', '"verify"', '"complete"')
-
-
-def safe_unit(unit) -> str:
-    """Ledger ``unit`` reduced to a printable name, or "" if it is not one."""
-    name = str(unit or "")
-    return name if _SAFE_UNIT.match(name) else ""
-
-
-def _elide(name: str, width: int = _NAME_MAX) -> str:
-    """Trim a display name to width, end-cut with a flush U+2026.
-
-    Matches Claude Code's own convention, read out of the 2.1.235 bundle
-    rather than guessed: its ``truncateToWidth`` keeps the prefix and appends
-    ``\\u2026`` with no separating space, and its Ink wrap dispatcher defaults
-    every ``truncate*`` position to *end*. Middle-cut exists there only for
-    filesystem paths (``truncatePathMiddle``, which keys on ``/`` to preserve
-    a basename); ``wrap:"truncate-middle"`` appears zero times in the JSX.
-    A unit slug has no ``/``, so it takes the label path, not the path path.
-
-    Middle-cut was tried first, to stop siblings like
-    ``gauge-unit-injection-refute`` and ``gauge-unit-injection-empirical``
-    rendering identically. That collision was real, but it was a symptom of a
-    22-column budget, not of the cut position: at 32 both names fit whole and
-    nothing is elided at all. Fixing the width removed the reason to deviate.
-
-    ``len`` is the display width here only because _SAFE_UNIT admits nothing
-    but ASCII ``[A-Za-z0-9._-]``. Claude Code measures with grapheme-aware
-    ``Bun.stringWidth`` because it must; the allowlist is what buys us the
-    shortcut. Widen that charset and this needs to become width-aware too.
-    """
-    return name if len(name) <= width else name[: width - 1] + "…"
-
-
-def _age_short(tid: str, now: float | None = None) -> str:
-    """Runtime from the id's own UTC stamp — no stat, no ndjson, no clock skew.
-
-    ``T-YYYYMMDD-HHMMSS-xxxxxx``. _SAFE_TID has already pinned the shape, so the
-    only way here fails is an impossible date (month 13), which strptime raises
-    on. A child that reports no age is still listed; the age is decoration.
-    """
-    try:
-        stamp = calendar.timegm(time.strptime(tid[2:17], "%Y%m%d-%H%M%S"))
-    except (ValueError, IndexError):
-        return ""
-    secs = int((time.time() if now is None else now) - stamp)
-    if secs < 0:  # child stamped in the future — clamp, never render "-4m"
-        secs = 0
-    if secs < 60:
-        # Minutes-only rendered every fresh child as "0m", so during the one
-        # moment you actually watch a fan-out — the seconds after spawning it
-        # — every row read the same and the column carried no information.
-        return f"{secs}s"
-    if secs < 3600:
-        return f"{secs // 60}m"
-    if secs < 86400:
-        return f"{secs // 3600}h"
-    # Clamped to two digits so the field can never exceed 3 columns. The row
-    # format is f"{age:>3}", and Python's :>3 is a *minimum* width — it pads
-    # but never truncates, so a 4-char "100d" would silently shift the build
-    # mark right on that row alone. A child this old is pathological either
-    # way; "99d" and "412d" carry the same operational meaning.
-    return f"{min(secs // 86400, 99)}d"
-
-
-def _tessera_root() -> Path:
-    # Test hook only. Do not honour TESSERA_DIR — that is the manager's knob
-    # and must not steer an unsandboxed statusLine renderer.
-    override = os.environ.get("CONTEXT_GAUGE_TESSERA_ROOT")
-    if override:
-        return Path(override)
-    return _TESSERA_ROOT_DEFAULT
-
-
-def _children_disabled() -> bool:
-    raw = os.environ.get("CONTEXT_GAUGE_CHILDREN", "1")
-    return str(raw).strip().lower() in {"0", "false", "no", "off"}
-
-
-def _children_all() -> bool:
-    raw = os.environ.get("CONTEXT_GAUGE_CHILDREN_ALL", "")
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _issue_index(root: Path) -> tuple[dict[str, dict] | None, set[str]]:
-    """visa → {session, unit, fence} for each ledger issue row, plus terminal visas.
-
-    Last issue row per visa wins. Index None means the ledger could not be
-    opened as a regular file (caller fail-opens: shows every running id,
-    unnamed, and treats the terminal set as empty). A missing ledger is an
-    empty map and an empty terminal set: nothing is attributed, nothing is
-    subtracted. ``manager_session`` is executor-adjacent once it is copied
-    into this process; it is reduced with safe_session_id and never rendered.
-    ``unit`` is rendered, so it is reduced with safe_unit and dropped on any
-    mismatch.
-
-    One pass serves the session filter, the display names, and the terminal
-    set — the scan is now unconditional (a name is needed even when the
-    filter is disarmed), so lines that cannot be an issue or terminal row
-    skip json.loads entirely.
-
-    Cost, measured 2026-08-19 against a 2.28 MB / 772-row fixture (the real
-    ledger was 2.31 MB / 808 rows at the time), Python 3.14, 80 interleaved
-    iterations: plain loop p50 6.17 ms / worst 11.2 ms; with the token
-    prefilter below p50 4.11 ms / worst 12.3 ms. Against a 2 s refresh that is
-    0.2% of a tick, and it is linear — a 10x ledger measured p50 42.9 ms /
-    worst 65 ms, still only 3%. Growth is the thing to watch, not the constant.
-
-    Two alternatives were measured and rejected. A reverse mmap scan that stops
-    once every running visa is resolved is 10x faster (p50 0.37 ms) *when the
-    children are recent*, but degrades to a full pass (p50 40 ms at 10x) as
-    soon as one long-running child sits near the head of the ledger — which is
-    the normal case here, since a strip exists to show long-running work. A
-    hand-rolled top-level extractor replacing json.loads was 12x *slower*
-    (p50 71 ms): the C parser beats a bytecode scanner. If this ever does need
-    fixing, rotate the ledger; do not make this reader cleverer. It is a
-    fail-open renderer on a 2 s timer and it must never be the thing that hangs.
-    """
-    path = root / "ledger.jsonl"
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(path, flags)
-    except FileNotFoundError:
-        return {}, set()
-    except OSError:
-        return None, set()
-    owned = True
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None, set()
-        out: dict[str, dict] = {}
-        terminal: set[str] = set()
-        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
-            owned = False
-            for line in fh:
-                # Cheap reject before the expensive parse: an issue or
-                # terminal row must contain one of these tokens somewhere, so
-                # a line without any cannot be one. Deliberately looser than
-                # '"kind": "issue"' — that would miss the compact
-                # separator-free form.
-                #
-                # This is an optimisation and NOT the gate. The tokens are
-                # reachable as data (a return row can carry "issue" in its
-                # payload), so everything that survives here still faces the
-                # parsed `kind` check below. Pinned by
-                # test_nested_issue_token_does_not_bypass_the_kind_check.
-                if not any(tok in line for tok in _LEDGER_KEEP_TOKENS):
-                    continue
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                visa = obj.get("visa")
-                if not isinstance(visa, str) or not _SAFE_TID.match(visa):
-                    continue
-                kind = obj.get("kind")
-                if kind in _TERMINAL_KINDS:
-                    terminal.add(visa)
-                if kind != "issue":
-                    continue
-                fence = obj.get("fence")
-                out[visa] = {
-                    "session": safe_session_id(obj.get("manager_session") or ""),
-                    "unit": safe_unit(obj.get("unit")),
-                    "fence": fence if fence in _FENCES else "",
-                }
-        return out, terminal
-    except OSError:
-        return None, set()
-    finally:
-        if owned:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
-def _filter_running_to_session(running: list[str], index: dict | None) -> list[str]:
-    """Keep tids whose issue.manager_session is this Claude session.
-
-    Unset / unsafe CLAUDE_CODE_SESSION_ID, or CONTEXT_GAUGE_CHILDREN_ALL,
-    leaves the list unchanged (the unscoped strip). An unreadable ledger
-    (index None) also fail-opens. When the filter is armed, a tid with no
-    issue row or no usable manager_session is dropped.
-    """
-    if not running or _children_all():
-        return running
-    want = safe_session_id(os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
-    if not want:
-        return running
-    if index is None:
-        return running
-    return [tid for tid in running if (index.get(tid) or {}).get("session") == want]
-
-
-def list_running_tesserae(root: Path | None = None) -> list[str]:
-    """Return allowlisted ids that are live-without-raw. Two listings, no reads."""
-    if _children_disabled():
-        return []
-    root = _tessera_root() if root is None else root
-    try:
-        live_names = os.listdir(root / "live")
-    except OSError:
-        return []
-    try:
-        raw_names = os.listdir(root / "raw")
-    except FileNotFoundError:
-        raw_names = []
-    except OSError:
-        return []
-
-    raw_ids = set()
-    for name in raw_names:
-        if name.endswith(".json"):
-            tid = name[:-5]
-            if _SAFE_TID.match(tid):
-                raw_ids.add(tid)
-
-    running = []
-    for name in live_names:
-        if not name.endswith(".ndjson"):
-            continue
-        tid = name[:-7]
-        if _SAFE_TID.match(tid) and tid not in raw_ids:
-            running.append(tid)
-    # Id embeds UTC YYYYMMDD-HHMMSS; reverse sort is newest-first without mtime.
-    running.sort(reverse=True)
-    return running
-
-
-def _fence_summary(running: list[str], meta: dict) -> str:
-    """"read" when the fleet is uniform, "7 read · 2 build" when it is not."""
-    tally = {f: 0 for f in _FENCES}
-    unknown = 0
-    for tid in running:
-        fence = (meta.get(tid) or {}).get("fence") or ""
-        if fence in tally:
-            tally[fence] += 1
-        else:
-            unknown += 1
-    named = [f for f, c in tally.items() if c]
-    if len(named) == 1 and not unknown:
-        return named[0]
-    parts = [f"{tally[f]} {f}" for f in named]
-    if unknown:
-        parts.append(f"{unknown} ?")
-    # A bare separator, not _SEP: the caller already wraps this whole string
-    # in _DIM, and _SEP carries its own _RESET. Nested SGR does not stack —
-    # a reset is absolute — so an inner _SEP would close the dim early and
-    # render everything after the first separator brighter than what precedes it.
-    return " · ".join(parts)
-
-
-def _rank_children(running: list[str], meta: dict) -> list[str]:
-    """Order children by how much a row about them *tells you*.
-
-    This decides both the row order and — once the fleet outgrows the strip —
-    which children keep a row at all. The rows you lose should be the ones you
-    could have guessed. Two rules, in order:
-
-    1. ``build`` fences first. A writer is the one child that can change the
-       repo, and with build fences gated behind an operator grant it is also
-       the rarest thing on the bar. If exactly one of nine children can write,
-       that is the row worth spending.
-    2. Then oldest first. In a wide fan the children are spawned seconds
-       apart, so age barely separates them — which means an *old* child is
-       almost always a straggler from an earlier round, and stragglers are the
-       whole reason to look at the strip. A child spawned 40 seconds ago is
-       fine by definition; one still running after 21h is the news.
-
-    Oldest-first is also the calmer render, which is not obvious: it is the
-    long tail that changes least, so rows stop jumping as new work is spawned.
-    Newest-first churns the top of the strip on every fan-out, at a 2 s tick.
-
-    ``running`` arrives newest-first, so this reverses within each rank. The
-    count in the header and the ``+N more`` tail are computed from the full
-    list, so no policy here can misstate how wide the fleet actually is.
-    """
-    def rank(tid: str) -> tuple[int, str]:
-        is_build = (meta.get(tid) or {}).get("fence") == "build"
-        # tid sorts lexically by its embedded UTC stamp, so plain ascending
-        # order is oldest-first — no parsing, no clock, no mtime.
-        return (0 if is_build else 1, tid)
-
-    return sorted(running, key=rank)
-
-
-def children_lines(root: Path | None = None) -> list[str]:
-    """A header row plus one row per running tessera, tail-collapsed.
-
-    At most ``1 + CHILDREN_MAX`` rows whatever the fleet width, so a wide fan
-    can never push the prompt off screen. Empty list when nothing is running:
-    the strip costs zero rows when idle.
-
-    Filesystem residue (live-without-raw) is the candidate set; ledger
-    terminal rows subtract from it here, not in list_running_tesserae. An
-    unreadable ledger fail-opens: the terminal set is empty and residue
-    renders unnamed rather than blanking the bar.
-    """
-    root = _tessera_root() if root is None else root
-    running = list_running_tesserae(root)
-    if not running:
-        return []
-    # One ledger pass feeds the session filter, the display names, and the
-    # terminal set. Residue is the candidate list; terminal rows subtract.
-    index, terminal = _issue_index(root)
-    running = _filter_running_to_session(running, index)
-    running = [t for t in running if t not in terminal]
-    if not running:
-        return []
-    meta = index or {}
-
-    # Rank first, truncate second. Ranking only on the overflow branch would
-    # make row order depend on fleet size: a child sitting fourth would jump
-    # to the top the moment a fifth spawned. Same order at every width.
-    n = len(running)
-    ranked = _rank_children(running, meta)
-    if n > CHILDREN_MAX:
-        # Spend the last row on the overflow marker, not on one more child.
-        shown, extra = ranked[: CHILDREN_MAX - 1], n - (CHILDREN_MAX - 1)
-    else:
-        shown, extra = ranked, 0
-
-    # safe_unit again on the print path: the sanitizer guards the terminal, so
-    # it belongs where text is rendered, not only where it was parsed.
-    names = [
-        _elide(safe_unit((meta.get(tid) or {}).get("unit")) or _NO_NAME)
-        for tid in shown
-    ]
-    width = max(len(name) for name in names)
-
-    noun = "tessera" if n == 1 else "tesserae"
-    lines = [f"{_DIM}⬡ {n} {noun}{_RESET}{_SEP}{_DIM}{_fence_summary(running, meta)}{_RESET}"]
-    for i, (tid, name) in enumerate(zip(shown, names)):
-        glyph = "└" if (i == len(shown) - 1 and not extra) else "├"
-        age = _age_short(tid)
-        # The build mark goes last: a wide glyph mid-row would shift every
-        # column after it on terminals that render it double-width.
-        mark = " ⚡" if (meta.get(tid) or {}).get("fence") == "build" else ""
-        lines.append(
-            f"{_DIM} {glyph}{_RESET} {name:<{width}}"
-            f"  {_DIM}{tid[-6:]}{_RESET}  {_DIM}{age:>3}{_RESET}{mark}"
-        )
-    if extra:
-        lines.append(f"{_DIM} └ +{extra} more{_RESET}")
-    return lines
-
-
 def main() -> int:
     args = sys.argv[1:]
 
@@ -1418,6 +1021,27 @@ def main() -> int:
         i = args.index("--calibrate") + 1
         path = args[i] if i < len(args) and not args[i].startswith("-") else None
         print(calibrate(path))
+        return 0
+
+    if "--record-sample" in args:
+        # One reading as JSON on stdin, from a caller that has the figures but no
+        # statusLine payload: the Claude Code mod, which reads the engine's own.
+        # Same row, same dedup, same opt-out as the live paths. Exit 0 whatever
+        # arrives: the caller is a UI that must never wait on a sampler. The ack
+        # says only that this CLI has the mode; an older one exits 0 in silence,
+        # and the caller must be able to tell the two apart.
+        try:
+            data = json.load(sys.stdin)
+            if isinstance(data, dict) and not _disabled():
+                record_sample(
+                    data.get("session_id") or "",
+                    "grok" if data.get("harness") == "grok" else "claude",
+                    data.get("working"), data.get("total"), data.get("floor"),
+                    data.get("window"), data.get("model") or "", data.get("effort") or "",
+                )
+        except Exception:
+            pass
+        print(RECORD_SAMPLE_ACK)
         return 0
 
     if "--transcript" in args:
@@ -1528,13 +1152,6 @@ def main() -> int:
         _safe_write(statusline_claude(tp, model_name, payload_window, claude_sid, effort))
     except Exception:
         _safe_write("")
-    # ADDITIONAL stdout lines: each print is another status row (Claude Code docs).
-    # Isolated so a children failure can never blank the fuel bar above it.
-    try:
-        for line in children_lines():
-            _safe_write(line)
-    except Exception:
-        pass
     return 0
 
 
