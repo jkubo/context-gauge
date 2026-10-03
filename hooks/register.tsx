@@ -276,8 +276,9 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // Other mods draw in this band too, so the fuel row goes on top of whatever the
-  // chain beneath returns rather than in place of it. A survey owns the band.
+  // Other mods draw in this band too, so the fuel row goes under whatever the
+  // chain beneath returns rather than in place of it: the lane and fleet rows read
+  // first and the fuel sits against the prompt. A survey owns the band.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || held.isDisabled) {
       return next(e)
@@ -312,8 +313,8 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        {row}
         {below}
+        {row}
       </Box>
     )
   })
