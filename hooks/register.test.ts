@@ -117,7 +117,8 @@ const flat = (node: Node | string): string => (typeof node === 'string' ? node :
 
 /** The fuel row's runs, as drawn: a bare string is the surface's own colour, a Text its props. */
 function runsOf(drawn: unknown): (string | { text: string; props: Record<string, unknown> | undefined })[] {
-  const row = (drawn as Node).children?.[0]
+  // The fuel row is the band's last child: the chain beneath draws above it.
+  const row = (drawn as Node).children?.at(-1)
 
   return (row && typeof row !== 'string' ? (row.children ?? []) : []).map(run =>
     typeof run === 'string' ? run : { text: flat(run), props: run.props },
@@ -131,7 +132,7 @@ const EFFORT = [said('user', '<command-name>/effort</command-name>'), said('user
 const BASH = [said('user', '<bash-input>ls</bash-input>'), said('user', '<bash-stdout>a</bash-stdout><bash-stderr></bash-stderr>')]
 
 describe('the band above the prompt', () => {
-  test('draws the fuel row on top of what the chain beneath drew, on every surface it is raised on', async ($, on) => {
+  test('draws the fuel row under what the chain beneath drew, on every surface it is raised on', async ($, on) => {
     const world = worldOf(on, { tokens: 60_000, window: 1_000_000 })
     const clock = mock.clock(on)
 
@@ -148,7 +149,7 @@ describe('the band above the prompt', () => {
       expect(drawn, surface).toMatchObject({ type: 'Box', props: { flexDirection: 'column' } })
       expect(fuel?.text, surface).toBe('⛽ 🟠 ORANGE 140K · 20% of 1M ⚑ checkpoint · Opus 5')
       expect(await ui.find({ text: 'another mod' }), surface).toBeDefined()
-      expect(JSON.stringify(drawn).indexOf('ORANGE'), surface).toBeLessThan(JSON.stringify(drawn).indexOf('another mod'))
+      expect(JSON.stringify(drawn).indexOf('ORANGE'), surface).toBeGreaterThan(JSON.stringify(drawn).indexOf('another mod'))
       expect(await ui.find({ type: 'Text', text: /^⛽ 🟠 ORANGE 140K$/ }), surface).toMatchObject({ props: { color: '#ff8700' } })
       await ui.unmount()
     }
