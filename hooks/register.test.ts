@@ -278,7 +278,7 @@ describe('the band above the prompt', () => {
       const drawn = await ui.drawn()
 
       expect(drawn, surface).toMatchObject({ type: 'Box', props: { flexDirection: 'column' } })
-      expect(drawn?.props, surface).not.toHaveProperty('width')
+      expect((drawn as Node | undefined)?.props, surface).not.toHaveProperty('width')
       expect(row, surface).toMatchObject({ props: { wrap: 'truncate-end' } })
       await ui.unmount()
     }
