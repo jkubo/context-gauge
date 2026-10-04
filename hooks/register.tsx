@@ -48,8 +48,6 @@ type Held = {
   isDisabled: boolean
   poller: Timer | undefined
   isPolling: boolean
-  /** The reading last written, so a poll that saw nothing new writes nothing. */
-  written: string
   /**
    * Session id → its floor; undefined once the store was asked and had no
    * decision, null once the session proved unable to have one (resolveFloor, or
@@ -127,7 +125,12 @@ async function floorFor($: EngineInterface, held: Held, id: string, tokens: numb
   return floor
 }
 
-/** Turns the engine's figures into a reading, and writes it only when it changed. */
+/**
+ * Turns the engine's figures into a reading, and writes it only when it differs
+ * from the one the state holds. Not from the one this load wrote last: a /clear
+ * empties the session's state and fires no session.start while this load and its
+ * poller run on, so the same reading must go back in.
+ */
 async function publish($: EngineInterface, held: Held, context: SessionContextUsage): Promise<GaugeReading> {
   // An all-zero fill is a stub, not a reading (the statusLine skips it too).
   const tokens = context.tokens !== undefined && context.tokens > 0 ? context.tokens : undefined
@@ -140,11 +143,8 @@ async function publish($: EngineInterface, held: Held, context: SessionContextUs
     ...(floor !== undefined && { floor }),
     ...(model !== '' && { model }),
   }
-  const key = JSON.stringify(value)
-
-  if (key !== held.written) {
+  if (JSON.stringify(value) !== JSON.stringify(await read($, reading))) {
     await $.state.set(READING, value)
-    held.written = key
   }
 
   return value
@@ -213,7 +213,6 @@ export const register: Register = on => {
     isDisabled: false,
     poller: undefined,
     isPolling: false,
-    written: '',
     floors: new Map(),
     isSamplerOff: false,
   }

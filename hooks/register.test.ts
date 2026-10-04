@@ -34,6 +34,11 @@ type World = {
   turnsAsked: number
   /** What the engine's compaction does when asked: replaces the transcript, or is vetoed. */
   compaction: 'replaces' | 'vetoed'
+  /**
+   * Null until a /clear empties the session's state; then the keys written since,
+   * every other value reading as its atom's initial.
+   */
+  cleared: Set<string> | null
 }
 
 function worldOf(
@@ -69,6 +74,7 @@ function worldOf(
     logs: [],
     turnsAsked: 0,
     compaction: 'replaces',
+    cleared: null,
   }
 
   mock.env(on, env)
@@ -95,7 +101,8 @@ function worldOf(
 
     return { value: { exitCode: 0, stdout: world.answer, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  on('state.set', ($, e, next) => (world.writes.push(e.value), next(e)))
+  on('state.set', ($, e, next) => (world.writes.push(e.value), world.cleared?.add(e.key), next(e)))
+  on('state.get', ($, e, next) => (world.cleared !== null && !world.cleared.has(e.key) ? { value: { value: undefined, version: 0 } } : next(e)))
   on('ui.log', ($, e) => (world.logs.push(e.text), { value: undefined }))
   on('ui.invalidate', () => ({ value: undefined }))
   // Another mod's drawing in the same band: what the chain beneath answers.
@@ -362,6 +369,36 @@ describe('the reading in state', () => {
     world.context = { tokens: 210_000, window: 1_000_000 }
     await clock.advance(1_500)
     expect(world.writes).toHaveLength(2)
+  })
+
+  // A /clear empties the session's state while this load and its poller run on, and
+  // fires no session.start. Cleared before the first reply, the reading after it is
+  // the same as before, so a write skipped as "what I wrote last" left the band dark.
+  test('a /clear that empties it gets the reading back at the next poll, though it reads the same as before', async ($, on) => {
+    const world = worldOf(on, { window: 1_000_000 })
+    const clock = mock.clock(on)
+    const placeholder = async (): Promise<unknown> => {
+      const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'AbovePrompt', props: BAND })
+      const found = await ui.find({ type: 'Text', text: /^⛽ …$/ })
+
+      await ui.unmount()
+
+      return found
+    }
+
+    await $.session.start(SESSION)
+    await clock.settle()
+    expect(await placeholder()).toBeDefined()
+
+    world.cleared = new Set()
+    expect(await placeholder(), 'emptied: nothing to draw').toBeUndefined()
+
+    await clock.advance(1_500)
+    expect(world.writes).toEqual([
+      { window: 1_000_000, model: 'Opus 5' },
+      { window: 1_000_000, model: 'Opus 5' },
+    ])
+    expect(await placeholder()).toBeDefined()
   })
 })
 

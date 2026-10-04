@@ -188,6 +188,10 @@ interface. This repository is one. Installed, it draws the fuel band directly ab
   of the two axes, so that can only understate it. At a ratio GREEN no band is named, since
   the working set could still be anywhere (400K of a 1M window is 40%, all of it reasoning
   context); the numbers are drawn plain. No floor, no calibration sample.
+- **A `/clear` starts the band over.** The cleared conversation is a new session: the row
+  reads `⛽ …` until its first reply, which seeds its own floor. Claude Code empties a mod's
+  state on a `/clear` and runs no `session.start`, so each reading is checked against what
+  the state holds rather than what the mod last wrote, and the row is back within one poll.
 - **Nothing reaches the model.** The band is drawn for the operator only; the mod adds no
   prompt context and hooks no tool call. Its one other hook only observes compactions.
 - **Fitted thresholds** are read from `CONTEXT_GAUGE_THRESHOLDS`, else
